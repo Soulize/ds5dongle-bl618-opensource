@@ -558,8 +558,9 @@ static int l2cap_intr_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
                     l2_slow_since_log++;
                     if (l2_slow_last_log_us == 0 ||
                         now - l2_slow_last_log_us >= 1000000ULL) {
-                        LOG_INF("[L2-DIAG] #%u gap=%uus SLOW (n=%u/s)\n",
-                               l2_diag_cnt, gap, l2_slow_since_log);
+                        if (l2_slow_since_log > 5)
+                            LOG_INF("[L2-DIAG] #%u gap=%uus SLOW (n=%u/s)\n",
+                                   l2_diag_cnt, gap, l2_slow_since_log);
                         if (!page_scan_fallback_fired &&
                             l2_slow_since_log > 20) {
                             page_scan_fallback_fired = true;
