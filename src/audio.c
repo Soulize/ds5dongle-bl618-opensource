@@ -453,7 +453,7 @@ int audio_init(void)
     }
 
     encoder = (OpusEncoder *)encoder_mem;
-    err = opus_encoder_init(encoder, 48000, 2,
+    err = opus_encoder_init(encoder, 48000, 1,
                             OPUS_APPLICATION_RESTRICTED_CELT);
     if (err != OPUS_OK) {
         LOG_ERR("[AUDIO] Opus encoder init failed: %d\n", err);
@@ -465,8 +465,9 @@ int audio_init(void)
     opus_encoder_ctl(encoder, OPUS_SET_BITRATE(160000));
     opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
     opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
-    opus_encoder_ctl(encoder, OPUS_SET_FORCE_CHANNELS(1));
-    encoder_channels = 2;
+    opus_encoder_ctl(encoder, OPUS_SET_PREDICTION_DISABLED(1));
+    opus_encoder_ctl(encoder, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_SUPERWIDEBAND));
+    encoder_channels = 1;
 
     decoder = (OpusDecoder *)decoder_mem;
     err = opus_decoder_init(decoder, 48000, MIC_CHANNELS);
@@ -578,7 +579,8 @@ void audio_task(void *arg)
                         opus_encoder_ctl(encoder, OPUS_SET_BITRATE(160000));
                         opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
                         opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
-                        opus_encoder_ctl(encoder, OPUS_SET_FORCE_CHANNELS(1));
+                        opus_encoder_ctl(encoder, OPUS_SET_PREDICTION_DISABLED(1));
+                        opus_encoder_ctl(encoder, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_SUPERWIDEBAND));
                         encoder_channels = target_channels;
                         LOG_INF("[AUDIO] Encoder reinit %dch\n", target_channels);
                     } else {
