@@ -219,6 +219,21 @@ static volatile bool     mic_active  = false;
 
 static uint8_t USB_NOCACHE_RAM_SECTION iso_mic_tx_buf[USB_AUDIO_MIC_MPS];
 
+static volatile uint32_t mic_diag_send_cnt    = 0;
+static volatile uint32_t mic_diag_underflow   = 0;
+static volatile uint32_t mic_diag_zero_samples = 0;
+
+void usb_audio_mic_diag(uint32_t *send_cnt, uint32_t *underflow,
+                        uint32_t *zero_samples)
+{
+    *send_cnt     = mic_diag_send_cnt;
+    *underflow    = mic_diag_underflow;
+    *zero_samples = mic_diag_zero_samples;
+    mic_diag_send_cnt     = 0;
+    mic_diag_underflow    = 0;
+    mic_diag_zero_samples = 0;
+}
+
 /* ---- ISO OUT endpoint callback (ISR context) ---- */
 static void audio_ep_out_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
@@ -272,6 +287,12 @@ static void mic_send_next(uint8_t busid)
     uint32_t samples_per_pkt = 48;  /* 48 stereo pairs per 1ms frame */
     int16_t *tx = (int16_t *)iso_mic_tx_buf;
     uint32_t to_send = (avail >= samples_per_pkt) ? samples_per_pkt : avail;
+
+    mic_diag_send_cnt++;
+    if (to_send < samples_per_pkt) {
+        mic_diag_underflow++;
+        mic_diag_zero_samples += (samples_per_pkt - to_send);
+    }
 
     for (uint32_t i = 0; i < to_send; i++) {
         uint32_t idx = ((rd + i) % MIC_RING_SIZE) * USB_AUDIO_MIC_CHANNELS;

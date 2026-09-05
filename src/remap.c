@@ -125,8 +125,8 @@ static inline uint8_t get_src_bit(const uint8_t *p, int id)
     if (id >= REMAP_BTN_TP_L_TOUCH && id <= REMAP_BTN_TP_R_CLICK) {
         uint8_t mode = config_get()->tp_mode;
 
-        /* mode 0 (off): all zone buttons suppressed */
-        if (mode == 0) return 0u;
+        /* mode 0 (off) and mode 5 (full mouse): direction buttons suppressed */
+        if (mode == 0 || mode == 5) return 0u;
 
         /* Determine which button groups are active and their centers */
         bool left_active  = (mode == 1 || mode == 3 || mode == 4);
@@ -142,6 +142,9 @@ static inline uint8_t get_src_bit(const uint8_t *p, int id)
         if (tp[0] & 0x80) return 0u; /* finger 0 not active */
         int16_t x = tp[1] | ((tp[2] & 0x0F) << 8);
         int16_t y = ((tp[2] & 0xF0) >> 4) | (tp[3] << 4);
+
+        bool click_required = config_get()->tp_click_mode;
+        bool clicked = (p[9] & 0x02) != 0;
 
         /* Center point depends on mode */
         int16_t cx_l, cx_r;
@@ -160,7 +163,8 @@ static inline uint8_t get_src_bit(const uint8_t *p, int id)
             if (need_half_check && !left_half) return 0u;
             if (id == REMAP_BTN_TP_L_TOUCH) return 1u;
             if (id == REMAP_BTN_TP_L_CLICK)
-                return (p[9] & 0x02) ? 1u : 0u;
+                return clicked ? 1u : 0u;
+            if (click_required && !clicked) return 0u;
             int16_t dx = x - cx_l;
             int16_t dy = y - TP_CENTER_Y;
             int16_t adx = dx < 0 ? -dx : dx;
@@ -179,7 +183,8 @@ static inline uint8_t get_src_bit(const uint8_t *p, int id)
             if (need_half_check && left_half) return 0u;
             if (id == REMAP_BTN_TP_R_TOUCH) return 1u;
             if (id == REMAP_BTN_TP_R_CLICK)
-                return (p[9] & 0x02) ? 1u : 0u;
+                return clicked ? 1u : 0u;
+            if (click_required && !clicked) return 0u;
             int16_t dx = x - cx_r;
             int16_t dy = y - TP_CENTER_Y;
             int16_t adx = dx < 0 ? -dx : dx;
@@ -459,6 +464,13 @@ bool remap_has_kbd_targets(void)
     return false;
 }
 
+bool remap_btn_is_kbd(uint8_t btn_id)
+{
+    if (g_remap_is_identity || btn_id >= REMAP_BTN_COUNT)
+        return false;
+    return g_profiles[active_profile][btn_id].type == REMAP_TYPE_KBD;
+}
+
 bool remap_has_mouse_targets(void)
 {
     for (int p = 0; p < REMAP_PROFILE_COUNT; p++)
@@ -484,8 +496,8 @@ static inline int8_t clamp8(int16_t v)
 void remap_mouse_tick(const uint8_t *p)
 {
     uint8_t mode = config_get()->tp_mode;
-    /* Mouse only active in mode 2 (left mouse) or mode 3 (right mouse) */
-    if (mode != 2 && mode != 3) return;
+    /* Mouse active in mode 2 (left mouse), 3 (right mouse), or 5 (full mouse) */
+    if (mode != 2 && mode != 3 && mode != 5) return;
 
     const uint8_t *tp = &p[32];
     bool finger_active = !(tp[0] & 0x80);
@@ -497,8 +509,9 @@ void remap_mouse_tick(const uint8_t *p)
 
     bool in_mouse_zone = false;
     if (finger_active) {
-        if (mode == 2) in_mouse_zone = (x < TP_SPLIT_X);      /* left half */
-        else           in_mouse_zone = (x >= TP_SPLIT_X);     /* right half */
+        if (mode == 5)      in_mouse_zone = true;             /* full pad */
+        else if (mode == 2) in_mouse_zone = (x < TP_SPLIT_X); /* left half */
+        else                in_mouse_zone = (x >= TP_SPLIT_X); /* right half */
     }
 
     int8_t dx = 0, dy = 0;
@@ -528,22 +541,24 @@ void remap_mouse_tick(const uint8_t *p)
     uint32_t now_ms = (uint32_t)(bflb_mtimer_get_time_us() / 1000);
 
     if (physical_click && in_mouse_zone) {
-        if (!tp_click_held) {
-            tp_click_held = true;
-            tp_click_down_ms = now_ms;
-            tp_right_triggered = false;
-        }
-        if (!tp_right_triggered && (now_ms - tp_click_down_ms >= TP_MOUSE_LONG_PRESS_MS)) {
-            tp_right_triggered = true;
-        }
-        if (tp_right_triggered)
-            buttons |= 0x02; /* right button */
-    } else if (tp_click_held) {
-        /* Released */
-        if (tp_right_triggered) {
-            buttons = 0; /* release right */
+        if (mode == 5) {
+            buttons |= (x < TP_SPLIT_X) ? 0x01 : 0x02;
         } else {
-            /* Short press → left click (send press now, release next frame) */
+            if (!tp_click_held) {
+                tp_click_held = true;
+                tp_click_down_ms = now_ms;
+                tp_right_triggered = false;
+            }
+            if (!tp_right_triggered && (now_ms - tp_click_down_ms >= TP_MOUSE_LONG_PRESS_MS)) {
+                tp_right_triggered = true;
+            }
+            if (tp_right_triggered)
+                buttons |= 0x02;
+        }
+    } else if (tp_click_held) {
+        if (tp_right_triggered) {
+            buttons = 0;
+        } else {
             buttons = 0x01;
         }
         tp_click_held = false;
@@ -571,12 +586,12 @@ void remap_mouse_tick(const uint8_t *p)
 void remap_tp_cycle_mode(void)
 {
     struct config_body *cfg = config_get();
-    uint8_t mask = cfg->tp_mode_enabled_mask & 0x1F;
+    uint8_t mask = cfg->tp_mode_enabled_mask & 0x3F;
     if (mask == 0) mask = 0x01;
 
     uint8_t cur = cfg->tp_mode;
-    for (int i = 0; i < 5; i++) {
-        cur = (cur + 1) % 5;
+    for (int i = 0; i < 6; i++) {
+        cur = (cur + 1) % 6;
         if (mask & (1u << cur)) break;
     }
     cfg->tp_mode = cur;

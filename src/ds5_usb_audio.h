@@ -87,4 +87,10 @@ bool usb_audio_mic_is_active(void);
  */
 void usb_audio_mic_stop(void);
 
+/**
+ * Read and reset mic diagnostic counters (ISR-safe).
+ */
+void usb_audio_mic_diag(uint32_t *send_cnt, uint32_t *underflow,
+                        uint32_t *zero_samples);
+
 #endif /* DS5_USB_AUDIO_H */

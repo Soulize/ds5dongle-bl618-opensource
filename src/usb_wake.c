@@ -4,7 +4,6 @@
 #include "config.h"
 #include "usbd_core.h"
 #include "bflb_mtimer.h"
-#include <string.h>
 #include "debug_log.h"
 
 #define WAKE_KEYCODE_F15        0x68
@@ -31,7 +30,9 @@ static volatile wake_state_t state        = WAKE_IDLE;
 static volatile uint64_t state_entered_us = 0;
 static uint8_t           key_attempts     = 0;
 static volatile uint64_t suspend_at_us    = 0;
+/* Set after suspend-debounce clean BT disconnect (name kept for callers). */
 static volatile bool     poweroff_sent    = false;
+static volatile bool     low_power_active = false;
 
 /*
  * Last-seen DualSense button bytes (USB payload offsets 7/8/9).
@@ -50,14 +51,6 @@ static void enter_state(wake_state_t s)
 {
     state = s;
     state_entered_us = now_us();
-}
-
-static void bt_power_off_controller(void)
-{
-    uint8_t payload[47];
-    memset(payload, 0, sizeof(payload));
-    payload[0] = 0x02;
-    bt_hid_host_set_feature_crc(0x08, payload, sizeof(payload));
 }
 
 static void request_host_wake(const char *reason)
@@ -85,6 +78,7 @@ void usb_wake_init(void)
     host_resumed = false;
     suspend_at_us = 0;
     poweroff_sent = false;
+    low_power_active = false;
 }
 
 void usb_wake_on_suspend(void)
@@ -153,6 +147,13 @@ void usb_wake_on_bt_disconnect(void)
     prev_b7 = 0x08;
     prev_b8 = 0x00;
     prev_b9 = 0x00;
+
+    /* After clean suspend-disconnect: silence radio only when wake is off.
+     * Wake mode keeps page scan so PS can reconnect and wake the host. */
+    if (host_suspended && poweroff_sent && !config_wake_enabled()) {
+        bt_hid_host_radio_idle();
+        LOG_INF("[WAKE] Suspend disconnect complete -> radio idle (wake off)\n");
+    }
 }
 
 bool usb_wake_host_suspended(void)
@@ -185,19 +186,22 @@ void usb_wake_task(void)
     const uint64_t now = now_us();
 
     /*
-     * Controller power-off after sustained suspend (battery-save).
-     * Runs independently of the wake-UP FSM: if the host has been
-     * suspended for longer than the debounce window, power off the
-     * controller so it doesn't drain its battery during sleep/shutdown.
-     * Transient hub-induced suspends are cancelled by resume/configured
-     * clearing suspend_at_us before the timer fires.
+     * Clean HCI disconnect after sustained suspend (align with Pico DS5Dongle).
+     * Do NOT send DualSense power_off first — that kills the controller and
+     * forces a connection-timeout teardown (0x08), which leaves the next
+     * reconnect at a degraded L2CAP rate (~12ms gap). A live HCI Disconnect
+     * (0x13/0x16) lets the stack tear down cleanly; the controller then
+     * idles/sleeps on its own.
+     * Transient hub suspends are cancelled by resume/configured clearing
+     * suspend_at_us before this timer fires.
      */
     if (suspend_at_us != 0 && host_suspended && !poweroff_sent &&
         now - suspend_at_us >= WAKE_POWEROFF_DEBOUNCE_US) {
-        bt_power_off_controller();
-        bt_hid_host_radio_idle();
         poweroff_sent = true;
-        LOG_INF("[WAKE] Suspend debounce elapsed -> controller power off + radio idle\n");
+        suspend_at_us = 0;
+        bt_hid_host_disconnect();
+        LOG_INF("[WAKE] Suspend debounce -> clean HCI disconnect (%s)\n",
+               config_wake_enabled() ? "wake on, keep page scan" : "wake off");
     }
 
     switch (state) {
@@ -230,4 +234,19 @@ void usb_wake_task(void)
         return;
     }
     }
+}
+
+bool usb_wake_is_poweroff_sent(void)
+{
+    return poweroff_sent;
+}
+
+void usb_wake_set_low_power(bool on)
+{
+    low_power_active = on;
+}
+
+bool usb_wake_is_low_power(void)
+{
+    return low_power_active;
 }

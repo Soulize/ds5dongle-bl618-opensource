@@ -25,4 +25,11 @@ void usb_wake_task(void);
 /** Check and clear radio wake flag. Call from bt_task context. */
 bool usb_wake_radio_wake_pending(void);
 
+/** True after suspend-debounce clean BT disconnect has been issued. */
+bool usb_wake_is_poweroff_sent(void);
+
+/** Low-power state management for USB suspend power saving. */
+void usb_wake_set_low_power(bool on);
+bool usb_wake_is_low_power(void);
+
 #endif /* USB_WAKE_H */

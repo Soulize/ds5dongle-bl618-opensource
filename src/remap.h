@@ -81,6 +81,7 @@ void remap_kbd_tick(const uint8_t *payload);
 void remap_on_disconnect(void);
 bool remap_has_kbd_targets(void);
 bool remap_has_mouse_targets(void);
+bool remap_btn_is_kbd(uint8_t btn_id);
 void remap_mouse_tick(const uint8_t *payload);
 const remap_entry_t *remap_get_table(void);
 const remap_entry_t *remap_get_profile_table(uint8_t profile);

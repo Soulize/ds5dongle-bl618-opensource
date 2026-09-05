@@ -146,26 +146,30 @@ void state_mgr_update(const uint8_t *data, uint8_t len)
     state[38] = data[38];
     state[40] = data[40];
 
-    /* Persist volume changes to config */
-    if (!config_get()->lock_volume) {
-        if (f0 & 0x10)
-            config_get()->headset_volume = data[4];
-        if (f0 & 0x20)
-            config_get()->speaker_volume = data[5];
-    } else {
+    /* Persist speaker volume to config (headset uses offset, not absolute) */
+    struct config_body *cfg = config_get();
+    uint8_t lv = cfg->lock_volume;
+    bool block_routing = (lv == 1 || lv == 3);
+    bool lock_vol      = (lv == 2 || lv == 3);
+    if (block_routing)
+        state[0] &= ~0x80;
+    if (lock_vol) {
         state[0] &= ~0x70;
+        state[1] |= 0x80;
+        state[37] = cfg->speaker_gain & 0x07;
+    } else {
+        if (f0 & 0x20)
+            cfg->speaker_volume = data[5];
+        if (cfg->speaker_gain > 0) {
+            state[1] |= 0x80;
+            state[37] = cfg->speaker_gain & 0x07;
+        }
     }
 
-    /* Config overlays — match DS5Dongle's tud_hid_set_report_cb */
-    struct config_body *cfg = config_get();
     if (cfg->trigger_reduce > 0) {
         state[1] |= 0x40;
         state[36] = (state[36] & 0x0F) |
                     ((cfg->trigger_reduce & 0x0F) << 4);
-    }
-    if (cfg->speaker_gain > 0) {
-        state[1] |= 0x80;
-        state[37] = cfg->speaker_gain & 0x07;
     }
 }
 
@@ -214,19 +218,20 @@ bool state_mgr_is_spk_active(void)
 
 void state_mgr_set_volume(uint8_t spk_vol, uint8_t hp_vol)
 {
-    if (config_get()->lock_volume)
+    uint8_t lv = config_get()->lock_volume;
+    if (lv == 2 || lv == 3)
         return;
     state[0] |= 0x30;
-    state[4] = hp_vol;
+    state[4] = config_apply_hp_offset(hp_vol);
     state[5] = spk_vol;
-    config_get()->headset_volume = hp_vol;
     config_get()->speaker_volume = spk_vol;
     vol_dirty = true;
 }
 
 void state_mgr_set_mute(bool mute)
 {
-    if (config_get()->lock_volume)
+    uint8_t lv = config_get()->lock_volume;
+    if (lv == 2 || lv == 3)
         return;
     state[1] |= 0x02;
     if (mute)
@@ -241,8 +246,8 @@ void state_mgr_restore_config_volume(void)
     struct config_body *cfg = config_get();
     state[0] |= 0x30;
     state[1] |= 0x02;
-    state[4] = cfg->headset_volume;
     state[5] = cfg->speaker_volume;
+    state[4] = config_apply_hp_offset(cfg->speaker_volume);
     state[9] &= ~0x60;
     vol_dirty = true;
 }

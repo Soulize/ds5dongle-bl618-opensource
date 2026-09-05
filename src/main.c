@@ -18,6 +18,11 @@
 #include "remap.h"
 
 #include "bl616_glb.h"
+#include "bl616_hbn.h"
+#include "bl616_pds.h"
+#include "bl616_pm.h"
+#include "bl616_aon.h"
+#include "bflb_clock.h"
 #include "btble_lib_api.h"
 #include "rfparam_adapter.h"
 #include "hci_driver.h"
@@ -37,12 +42,11 @@
 #define AUDIO_TASK_STACK_SIZE STACK_WORDS(1024*32)
 #define AUDIO_TASK_PRIORITY   (configMAX_PRIORITIES - 2)
 #define MIC_TASK_STACK_SIZE   STACK_WORDS(1024*12)
-#define MIC_TASK_PRIORITY     (configMAX_PRIORITIES - 4)
+#define MIC_TASK_PRIORITY     (configMAX_PRIORITIES - 4)  /* P3: runs in bt_task idle gaps */
 #define LED_TASK_STACK_SIZE   STACK_WORDS(1024*2)
 #define LED_TASK_PRIORITY     (tskIDLE_PRIORITY + 1)
 #define BOOT_HOLD_TICKS      30   /* 30 x 100ms = 3 seconds */
 #define BOOT_CLICK_WINDOW    5    /* 500ms window between clicks */
-#define RECONNECT_TIMEOUT_MS 2000
 #define HANDSHAKE_TIMEOUT_US  (10ULL * 1000000ULL)
 #define CONNECTING_TIMEOUT_TICKS pdMS_TO_TICKS(8000)
 #define L2CAP_FALLBACK_TIMEOUT_TICKS pdMS_TO_TICKS(3000)
@@ -59,6 +63,7 @@ static volatile bool bt_init_done = false;
 
 static volatile uint8_t cached_battery_level = 0xFF;
 static volatile uint8_t cached_battery_state = 0;
+static uint8_t last_batt_led_pct = 0xFF;
 
 /* LED auto-off timers */
 #define LED_DISABLE_OFF_US   (60ULL * 1000000ULL)  /* 1 minute */
@@ -100,19 +105,21 @@ static void apply_config_overlay(uint8_t *d, uint16_t len)
         d[1] |= 0x80;
         d[37] = cfg->speaker_gain & 0x07;
     }
-    if (cfg->lock_volume) {
-        static uint8_t lock_vol_log_cnt = 0;
+    uint8_t lv = cfg->lock_volume;
+    bool block_routing = (lv == 1 || lv == 3);
+    bool lock_vol      = (lv == 2 || lv == 3);
+    if (block_routing)
+        d[0] &= ~0x80;
+    if (lock_vol) {
         d[0] = (d[0] & ~0x70) | 0x30;
-        d[4] = cfg->headset_volume;
         d[5] = cfg->speaker_volume;
-        if (lock_vol_log_cnt < 5) {
-            lock_vol_log_cnt++;
-            LOG_INF("[VOL-LOCK] inject hp=%d spk=%d flags0=0x%02X\n",
-                    cfg->headset_volume, cfg->speaker_volume, d[0]);
-        }
+        d[4] = config_apply_hp_offset(cfg->speaker_volume);
+        d[1] |= 0x80;
+        d[37] = cfg->speaker_gain & 0x07;
     } else {
-        if (d[0] & 0x10) cfg->headset_volume = d[4];
         if (d[0] & 0x20) cfg->speaker_volume = d[5];
+        if (cfg->headset_vol_offset > 0 && (d[0] & 0x10))
+            d[4] = config_apply_hp_offset(d[4]);
     }
 }
 
@@ -229,10 +236,24 @@ static uint8_t cached_led_rgb[3];                 /* bytes 44-46: R, G, B */
 static uint8_t cached_player_ind = 0;             /* byte 43: PlayerIndicators */
 static bool    cached_player_valid = false;
 static bool    game_was_active_at_disconnect = false;  /* snapshot at BT disconnect */
+static uint64_t game_player_led_us = 0;                /* last time game set player LEDs */
+#define GAME_PLAYER_LED_TIMEOUT_US  (5ULL * 1000000ULL)
+static uint8_t battery_to_player_leds(uint8_t pct);
+static volatile uint8_t batt_peek_pct = 0xFF;         /* 0xFF=inactive, 0-10=peek active */
+static uint64_t batt_peek_expire_us = 0;               /* only accessed by bt_task */
+#define BATT_PEEK_HOLD_US           (3ULL * 1000000ULL)
 
-/* Called from the output forwarding path to snapshot game state
- * whenever the game sends a report with relevant flags set. */
-static void cache_output_state(const uint8_t *set_state_data)
+static inline void batt_pct_to_rgb(uint8_t pct, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    if (pct >= 6)       { *r=0x00; *g=0xFF; *b=0x00; }
+    else if (pct >= 4)  { *r=0xFF; *g=0xD0; *b=0x00; }
+    else if (pct >= 1)  { *r=0xFF; *g=0x60; *b=0x00; }
+    else                { *r=0xFF; *g=0x00; *b=0x00; }
+}
+
+/* Called from the output forwarding path (bt_task) to snapshot game state.
+ * During battery peek hold, force-injects peek LED data into every frame. */
+static void cache_output_state(uint8_t *set_state_data)
 {
     uint8_t f0 = set_state_data[0];
     uint8_t f1 = set_state_data[1];
@@ -248,6 +269,22 @@ static void cache_output_state(const uint8_t *set_state_data)
         memcpy(cached_trigger_l, set_state_data + 21, 11);
     }
 
+    /* Battery peek hold: force-inject peek LED data into every forwarded
+     * game frame so the controller continuously receives the peek state. */
+    if (batt_peek_pct != 0xFF) {
+        if (batt_peek_expire_us == 0)
+            batt_peek_expire_us = bflb_mtimer_get_time_us() + BATT_PEEK_HOLD_US;
+        if (bflb_mtimer_get_time_us() < batt_peek_expire_us) {
+            set_state_data[1] |= 0x14;
+            set_state_data[43] = battery_to_player_leds(batt_peek_pct);
+            batt_pct_to_rgb(batt_peek_pct,
+                            &set_state_data[44], &set_state_data[45], &set_state_data[46]);
+            return;
+        }
+        batt_peek_pct = 0xFF;
+        batt_peek_expire_us = 0;
+    }
+
     /* Cache LED color */
     if (f1 & 0x04) {
         cached_led_rgb[0] = set_state_data[44];
@@ -260,6 +297,7 @@ static void cache_output_state(const uint8_t *set_state_data)
     if (f1 & 0x10) {
         cached_player_ind = set_state_data[43];
         cached_player_valid = true;
+        game_player_led_us = bflb_mtimer_get_time_us();
     }
 }
 
@@ -268,16 +306,16 @@ static void send_led_primer(void)
 {
     state_mgr_init(init_set_state, DS5_USB_OUTPUT_PAYLOAD_LEN);
     struct config_body *cfg = config_get();
-    state_mgr_apply_config(cfg->speaker_volume, cfg->headset_volume,
+    uint8_t hp_vol = config_apply_hp_offset(cfg->speaker_volume);
+    state_mgr_apply_config(cfg->speaker_volume, hp_vol,
                            cfg->speaker_gain, cfg->trigger_reduce);
     uint8_t merged[DS5_USB_OUTPUT_PAYLOAD_LEN];
     state_mgr_get(merged, DS5_USB_OUTPUT_PAYLOAD_LEN);
 
-    /* Always include volume in primer so controller starts with correct level.
-     * Critical for lock_volume: without this, controller resets to default 0. */
     merged[0] |= 0x30;
-    LOG_INF("[PRIMER] vol hp=%d spk=%d lock=%d\n",
-            cfg->headset_volume, cfg->speaker_volume, cfg->lock_volume);
+    LOG_INF("[PRIMER] vol hp=%d spk=%d off=%d lock=%d\n",
+            hp_vol, cfg->speaker_volume, cfg->headset_vol_offset,
+            cfg->lock_volume);
 
     merged[44] = cfg->led_r;
     merged[45] = cfg->led_g;
@@ -302,11 +340,38 @@ static void send_led_primer(void)
     bt_hid_host_send_output(buf, DS5_BT_OUTPUT_EXT_SIZE);
 }
 
+/* Map battery pct (0–10) to PS5-native symmetric player indicator patterns.
+ * Works on both HW 0x03 (independent) and HW 0x04 (mirrored) revisions. */
+static uint8_t battery_to_player_leds(uint8_t pct)
+{
+    if (pct >= 8) return 0x1F;  /* 80-100%: ● ● ● ● ● */
+    if (pct >= 6) return 0x1B;  /* 60-79%:  ● ● ○ ● ● */
+    if (pct >= 4) return 0x15;  /* 40-59%:  ● ○ ● ○ ● */
+    if (pct >= 2) return 0x0A;  /* 20-39%:  ○ ● ○ ● ○ */
+    return 0x04;                /* 0-19%:   ○ ○ ● ○ ○ */
+}
+
+static void send_battery_led(uint8_t pct)
+{
+    uint8_t payload[DS5_USB_OUTPUT_PAYLOAD_LEN];
+    memset(payload, 0, sizeof(payload));
+    payload[1] = 0x10;  /* flags1: AllowPlayerIndicators */
+    payload[43] = battery_to_player_leds(pct);
+
+    uint8_t buf[DS5_BT_OUTPUT_EXT_SIZE];
+    build_bt_output_ext(payload, DS5_USB_OUTPUT_PAYLOAD_LEN, buf);
+    bt_hid_host_send_output(buf, DS5_BT_OUTPUT_EXT_SIZE);
+}
+
 /* Called from l2cap_intr_connected (earliest possible moment, pre-HANDSHAKE).
  * Sends the 0x32 primer to the controller immediately when L2CAP opens. */
 static void on_hid_primer(void)
 {
     send_led_primer();
+    game_player_led_us = 0;
+    batt_peek_pct = 0xFF;
+    batt_peek_expire_us = 0;
+    last_batt_led_pct = 0xFF;
     LOG_INF("[MAIN] Primer sent from l2cap_intr_connected\n");
 }
 
@@ -317,8 +382,16 @@ static void on_hid_input(const uint8_t *data, uint16_t len)
     /* data[0] = report ID (0x31), data[1] = flags */
     if ((data[1] >> 1) & 1) {
         /* Bit1 set: mic Opus frame at data[3], length = len - 3 */
-        if (len > 3)
+        if (len > 3) {
+#if LOG_LEVEL >= 3
+            static uint32_t mic_rpt_cnt = 0;
+            mic_rpt_cnt++;
+            if (mic_rpt_cnt <= 5)
+                LOG_DBG("[MIC-DIAG] rpt#%u raw_len=%u opus_len=%u\n",
+                        mic_rpt_cnt, len, len - 3);
+#endif
             audio_mic_feed(data + 3, (uint16_t)(len - 3));
+        }
         return;
     }
 
@@ -370,6 +443,10 @@ static void on_hid_state(enum bt_hid_host_state state)
             usb_deferred_disc_us = bflb_mtimer_get_time_us();
             LOG_INF("[MAIN] USB disconnect deferred (10s timer started)\n");
         }
+        game_player_led_us = 0;
+        batt_peek_pct = 0xFF;
+        batt_peek_expire_us = 0;
+        last_batt_led_pct = 0xFF;
         dse_reset();
         audio_reset();
         remap_on_disconnect();
@@ -526,6 +603,38 @@ static bool boot_button_pressed(void)
     return bflb_gpio_read(btn_gpio, BOOT_BUTTON_PIN) != 0;
 }
 
+/* ---- Low-power suspend helpers ---- */
+
+static void enter_light_sleep(void)
+{
+    LOG_INF("[LP] Entering light sleep (CPU 32MHz)\n");
+    led_status_set(LED_OFF);
+
+    GLB_Power_Off_AUPLL();
+
+    usb_wake_set_low_power(true);
+
+    GLB_Set_MCU_System_CLK(GLB_MCU_SYS_CLK_RC32M);
+    CPU_Set_MTimer_CLK(ENABLE, BL_MTIMER_SOURCE_CLOCK_MCU_XCLK, 31);
+}
+
+static void exit_light_sleep(void)
+{
+    uint8_t xtalType;
+    HBN_Get_Xtal_Type(&xtalType);
+    GLB_AUPLL_Ref_Clk_Sel(GLB_PLL_REFCLK_XTAL);
+    GLB_Power_On_AUPLL(&audioPllCfg_491P52M[xtalType], 1);
+
+    GLB_Set_MCU_System_CLK(GLB_MCU_SYS_CLK_TOP_WIFIPLL_320M);
+    HBN_Set_MCU_XCLK_Sel(HBN_MCU_XCLK_XTAL);
+    CPU_Set_MTimer_CLK(ENABLE, BL_MTIMER_SOURCE_CLOCK_MCU_XCLK, 39);
+
+    GLB_Set_USB_CLK_From_WIFIPLL(1);
+
+    usb_wake_set_low_power(false);
+    LOG_INF("[LP] Full speed restored\n");
+}
+
 static void bt_task(void *arg)
 {
     (void)arg;
@@ -562,23 +671,26 @@ static void bt_task(void *arg)
     LOG_INF("[BT_TASK] led OK\n");
 
     LOG_INF("[BT_TASK] try_reconnect...\n");
-    if (bt_hid_host_try_reconnect() == 0) {
-        /* Passive reconnect: page scan is enabled, wait for the
-         * controller to page us and create L2CAP channels. */
-        LOG_INF("[MAIN] Waiting for controller to reconnect...\n");
-        TickType_t start = xTaskGetTickCount();
-        while (!ds5_connected &&
-               (xTaskGetTickCount() - start) < pdMS_TO_TICKS(RECONNECT_TIMEOUT_MS)) {
+    int rc = bt_hid_host_try_reconnect();
+    if (rc == 0) {
+        /* Bonded device exists — pure page-scan window before Inquiry.
+         * Covers "plug dongle first, then short-press PS" (most common).
+         * BL616 HCI blocks page scan during active Inquiry, so we must
+         * give page scan exclusive airtime first. */
+#define PAGE_SCAN_WINDOW_MS 5000
+        LOG_INF("[BT_TASK] Bonded: page-scan only for %dms\n", PAGE_SCAN_WINDOW_MS);
+        for (int i = 0; i < PAGE_SCAN_WINDOW_MS / 100; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
+            if (bt_hid_host_get_state() != BT_HID_STATE_IDLE) {
+                LOG_INF("[BT_TASK] Connected during page-scan window (%dms)\n",
+                       (i + 1) * 100);
+                goto skip_initial_inquiry;
+            }
         }
-        if (!ds5_connected) {
-            LOG_WRN("[MAIN] Reconnect timed out, starting scan\n");
-            bt_hid_host_scan_start(0);
-        }
-    } else {
-        LOG_INF("[MAIN] No bonded device, starting scan\n");
-        bt_hid_host_scan_start(0);
+        LOG_INF("[BT_TASK] Page-scan window expired, starting Inquiry\n");
     }
+    bt_hid_host_scan_start(0);
+skip_initial_inquiry:
     LOG_INF("[BT_TASK] Entering main loop\n");
 
     uint8_t usb_out[USB_OUTPUT_BUF_SZ];
@@ -701,6 +813,7 @@ static void bt_task(void *arg)
                         } else {
                             LOG_INF("[BTN] Single click — only 1 bonded, fresh scan\n");
                             scan_fail_count = 0;
+                            bt_hid_host_clear_target();
                             if (ds5_connected) {
                                 scan_after_disconnect = true;
                                 bt_hid_host_disconnect();
@@ -712,6 +825,7 @@ static void bt_task(void *arg)
                     } else if (clicks >= 2) {
                         LOG_INF("[BTN] Double click — disconnect + fresh scan\n");
                         scan_fail_count = 0;
+                        bt_hid_host_clear_target();
                         if (ds5_connected) {
                             scan_after_disconnect = true;
                             bt_hid_host_disconnect();
@@ -729,7 +843,49 @@ static void bt_task(void *arg)
 
         if (usb_wake_radio_wake_pending()) {
             bt_hid_host_radio_wake();
-            LOG_INF("[MAIN] Radio wake — BT scan re-enabled after standby\n");
+            bt_hid_host_on_resume();
+            led_status_set(LED_PURPLE_BLINK_SLOW);
+            conn_led_start_us = bflb_mtimer_get_time_us();
+            conn_led_off = false;
+            usb_deferred_disc_us = 0;
+            LOG_INF("[MAIN] Radio wake — full restore after standby\n");
+        }
+
+        /* Low-power: idle clock reduction.
+         * No controller for >10s → CPU 32MHz.
+         * BT page scan + USB still work; user can connect anytime.
+         * Solves overheating on always-on USB ports where BIOS
+         * keeps sending SOF and USB SUSPEND never fires. */
+        {
+            static uint16_t idle_no_ctrl_ticks = 0;
+#define IDLE_DOWNCLOCK_TICKS 1000  /* ~10s at 10ms loop */
+
+            if (ds5_connected) {
+                if (usb_wake_is_low_power()) {
+                    LOG_INF("[LP] Controller connected, restoring full speed\n");
+                    exit_light_sleep();
+                }
+                idle_no_ctrl_ticks = 0;
+            } else {
+                if (idle_no_ctrl_ticks < IDLE_DOWNCLOCK_TICKS)
+                    idle_no_ctrl_ticks++;
+
+                if (!usb_wake_is_low_power() &&
+                    idle_no_ctrl_ticks >= IDLE_DOWNCLOCK_TICKS) {
+                    LOG_INF("[LP] No controller for 10s, entering idle downclock\n");
+                    if (config_wake_enabled())
+                        bt_hid_host_radio_wake();
+                    enter_light_sleep();
+                }
+
+                /* Keep page scan alive in light sleep for wake mode;
+                 * usb_wake_task may call radio_idle() after we entered. */
+                if (usb_wake_is_low_power() && config_wake_enabled() &&
+                    usb_wake_is_poweroff_sent()) {
+                    bt_hid_host_ensure_connectable();
+                }
+            }
+
         }
 
         /* Periodic RSSI read (~every 5 s) */
@@ -759,6 +915,7 @@ static void bt_task(void *arg)
         /* Deferred USB soft-disconnect: if BT disconnected and no reconnection
          * within the timeout, pull USB so Windows removes the phantom device. */
         if (usb_deferred_disc_us && !ds5_connected &&
+            !usb_wake_host_suspended() &&
             (bflb_mtimer_get_time_us() - usb_deferred_disc_us) > USB_DEFERRED_DISC_US) {
             usb_deferred_disc_us = 0;
             usb_soft_disconnect();
@@ -859,8 +1016,10 @@ static void bt_task(void *arg)
              * Each USB output frame is independently forwarded to BT with
              * only config overlays applied — no flag accumulation or merging. */
             if (state_mgr_is_spk_active()) {
+                int max_batch = audio_mic_active() ? 1 : 3;
                 int batch = 0;
-                while (xQueueReceive(output_queue, usb_out, 0) == pdTRUE) {
+                while (batch < max_batch &&
+                       xQueueReceive(output_queue, usb_out, 0) == pdTRUE) {
                     uint8_t *payload = usb_out + 1;
                     apply_config_overlay(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
                     cache_output_state(payload);
@@ -871,6 +1030,8 @@ static void bt_task(void *arg)
                     output_seq = (output_seq + 1) & 0x0F;
                     bt_hid_host_send_output(bt_out, DS5_BT_OUTPUT_REPORT_SIZE);
                     batch++;
+                    if (batch < max_batch)
+                        vTaskDelay(pdMS_TO_TICKS(1));
                 }
                 vTaskDelay(pdMS_TO_TICKS(24));
             } else if (xQueueReceive(output_queue, usb_out, pdMS_TO_TICKS(24)) == pdTRUE) {
@@ -975,13 +1136,32 @@ next_output_iter:;
                 } else {
                     stale_conn_since = 0;
                     scan_retry_ticks += idle_ticks;
-                    uint16_t retry_interval = ever_connected ? 600 : 300;
-                    if (scan_retry_ticks >= retry_interval) {
+
+                    uint16_t retry_interval;
+                    bool     allow_retry;
+
+                    if (ever_connected) {
+                        /* Controller disconnected — page scan primary,
+                         * slow Inquiry fallback. */
+                        retry_interval = 600;
+                        allow_retry = (scan_fail_count < MAX_SCAN_RETRIES);
+                    } else if (bt_hid_host_get_bonded_count() == 0) {
+                        /* No bonds (cleared or first use).
+                         * MUST discover via Inquiry — never stop.
+                         * Fast first (3s × 6), then slow (15s forever). */
+                        retry_interval = (scan_fail_count < 6) ? 30 : 150;
+                        allow_retry = true;
+                    } else {
+                        /* Bonded but not connected yet this session.
+                         * Page scan handles reconnect; limited Inquiry. */
+                        retry_interval = 300;
+                        allow_retry = (scan_fail_count < MAX_SCAN_RETRIES);
+                    }
+
+                    if (scan_retry_ticks >= retry_interval && allow_retry) {
                         scan_retry_ticks = 0;
-                        if (scan_fail_count < MAX_SCAN_RETRIES) {
-                            scan_fail_count++;
-                            bt_hid_host_scan_start(0);
-                        }
+                        scan_fail_count++;
+                        bt_hid_host_scan_start(0);
                     }
                 }
                 idle_ticks = 0;
@@ -1061,6 +1241,13 @@ static void usb_task(void *arg)
     uint64_t ps_key_rel_us   = 0;
     uint64_t ps_key_sched_us = 0;
 
+    /* Create button: release-to-send with combo window */
+    bool     create_prev       = false;
+    bool     create_used_combo = false;
+    uint64_t create_inject_us  = 0;
+    uint64_t create_press_start_us = 0;
+    bool     create_past_window = false;
+
     /* Remap profile switch: Create + D-pad Left/Right */
     bool     remap_combo_fired = false;
 
@@ -1070,6 +1257,13 @@ static void usb_task(void *arg)
     /* Volume combo: Options + D-pad Up/Down → Consumer Control Volume */
     bool     vol_key_active = false;
     uint64_t vol_repeat_us  = 0;
+    bool     opt_prev        = false;
+    bool     opt_used_combo  = false;
+    uint64_t opt_inject_us   = 0;
+    uint64_t opt_press_start_us = 0;
+    bool     opt_past_window    = false;
+    #define COMBO_WINDOW_US    (150ULL * 1000)
+    #define RELEASE_INJECT_MS  30
     #define VOL_REPEAT_FIRST_MS  400
     #define VOL_REPEAT_NEXT_MS   120
     #define CC_VOL_UP    0x01   /* bitmap bit0 = Volume Increment */
@@ -1118,7 +1312,8 @@ static void usb_task(void *arg)
                        (unsigned long)usb_fwd_count);
 
             /* Volume combo: Options(≡) + D-pad Up/Down → Consumer Control Vol.
-             * Detect BEFORE remap so we can suppress both buttons from gamepad. */
+             * Options is suppressed while held; on release without combo, inject
+             * a one-frame press so the game sees a tap. */
             {
                 bool opt_held = (raw_report[2 + DS5_BTN_BYTE] & DS5_BTN_OPTIONS_BIT) != 0;
                 uint8_t dv = raw_report[2 + DS5_DPAD_BYTE] & DS5_DPAD_MASK;
@@ -1130,6 +1325,7 @@ static void usb_task(void *arg)
 
                 uint64_t vt = bflb_mtimer_get_time_us();
                 if (vu && usb_gamepad_kbd_ready()) {
+                    opt_used_combo = true;
                     if (!vol_key_active) {
                         usb_gamepad_send_consumer_report(vu);
                         vol_key_active = true;
@@ -1147,67 +1343,140 @@ static void usb_task(void *arg)
                     vol_key_active = false;
                 }
 
-                if (vol_key_active) {
-                    raw_report[2 + DS5_BTN_BYTE] &= ~DS5_BTN_OPTIONS_BIT;
-                    raw_report[2 + DS5_DPAD_BYTE] = (raw_report[2 + DS5_DPAD_BYTE] & ~DS5_DPAD_MASK) | DS5_DPAD_NONE;
-                }
-            }
-
-            /* Remap profile switch: Create + D-pad Left → profile 0, Right → profile 1 */
-            {
-                bool create_held = (raw_report[2 + DS5_BTN_BYTE] & DS5_BTN_CREATE_BIT) != 0;
-                uint8_t dpad = raw_report[2 + DS5_DPAD_BYTE] & DS5_DPAD_MASK;
-
-                if (create_held && !remap_combo_fired) {
-                    int target = -1;
-                    if (dpad == DS5_DPAD_W)
-                        target = 0;
-                    else if (dpad == DS5_DPAD_E)
-                        target = 1;
-
-                    if (target >= 0 && target != remap_get_active_profile()) {
-                        remap_switch_profile((uint8_t)target);
-                        led_status_set(target == 0 ? LED_BLINK_ONCE : LED_BLINK_DOUBLE);
-                        LOG_INF("[REMAP] Combo → profile %d\n", target);
-                        remap_combo_fired = true;
+                bool opt_kbd = remap_btn_is_kbd(REMAP_BTN_OPTIONS);
+                if (opt_held) {
+                    if (!opt_prev)
+                        opt_press_start_us = vt;
+                    if (!opt_kbd) {
+                        if (opt_used_combo || (vt - opt_press_start_us) < COMBO_WINDOW_US) {
+                            raw_report[2 + DS5_BTN_BYTE] &= ~DS5_BTN_OPTIONS_BIT;
+                        } else {
+                            opt_past_window = true;
+                        }
                     }
+                    if (vol_key_active) {
+                        raw_report[2 + DS5_BTN_BYTE] &= ~DS5_BTN_OPTIONS_BIT;
+                        raw_report[2 + DS5_DPAD_BYTE] = (raw_report[2 + DS5_DPAD_BYTE] & ~DS5_DPAD_MASK) | DS5_DPAD_NONE;
+                    }
+                    opt_inject_us = 0;
+                } else if (opt_prev) {
+                    if (!opt_kbd && !opt_used_combo && !opt_past_window)
+                        opt_inject_us = bflb_mtimer_get_time_us() + RELEASE_INJECT_MS * 1000ULL;
+                    opt_used_combo = false;
+                    opt_past_window = false;
                 }
-                if (!create_held)
-                    remap_combo_fired = false;
+                if (!opt_held && opt_inject_us) {
+                    if (bflb_mtimer_get_time_us() < opt_inject_us)
+                        raw_report[2 + DS5_BTN_BYTE] |= DS5_BTN_OPTIONS_BIT;
+                    else
+                        opt_inject_us = 0;
+                }
+                opt_prev = opt_held;
             }
 
-            /* Touchpad mode cycle: Create + Touchpad Press */
+            /* --- Create combos: release-to-send ---
+             * Create is suppressed while held. On release without any combo,
+             * inject a one-frame press so the game sees a tap. */
             {
                 bool create_held = (raw_report[2 + DS5_BTN_BYTE] & DS5_BTN_CREATE_BIT) != 0;
-                bool tp_pressed  = (raw_report[2 + 9] & 0x02) != 0;
 
-                static uint8_t tp_dbg_cnt = 0;
-                if (create_held && tp_pressed && tp_dbg_cnt < 5) {
-                    LOG_INF("[TP-DBG] Create+TP detected, fired=%d mode=%u mask=0x%02x\n",
-                            tp_mode_combo_fired, config_get()->tp_mode,
-                            config_get()->tp_mode_enabled_mask);
-                    tp_dbg_cnt++;
+                /* Remap profile switch: Create + D-pad Left/Right */
+                {
+                    uint8_t dpad = raw_report[2 + DS5_DPAD_BYTE] & DS5_DPAD_MASK;
+                    if (create_held && !remap_combo_fired) {
+                        int target = -1;
+                        if (dpad == DS5_DPAD_W)      target = 0;
+                        else if (dpad == DS5_DPAD_E) target = 1;
+                        if (target >= 0 && target != remap_get_active_profile()) {
+                            remap_switch_profile((uint8_t)target);
+                            led_status_set(target == 0 ? LED_BLINK_ONCE : LED_BLINK_DOUBLE);
+                            LOG_INF("[REMAP] Combo → profile %d\n", target);
+                            remap_combo_fired = true;
+                            create_used_combo = true;
+                        }
+                    }
+                    if (!create_held)
+                        remap_combo_fired = false;
                 }
 
-                if (create_held && tp_pressed && !tp_mode_combo_fired) {
-                    remap_tp_cycle_mode();
-                    uint8_t new_mode = config_get()->tp_mode;
-                    static const uint8_t mode_blinks[] = {
-                        LED_BLINK_ONCE, LED_BLINK_DOUBLE, LED_BLINK_TRIPLE,
-                        LED_BLINK_TRIPLE, LED_BLINK_TRIPLE
-                    };
-                    led_status_set(mode_blinks[new_mode]);
-                    LOG_INF("[TP] Combo → mode %u\n", new_mode);
-                    tp_mode_combo_fired = true;
-                }
-                if (!create_held || !tp_pressed)
-                    tp_mode_combo_fired = false;
+                /* Touchpad mode cycle: Create + Touchpad Press */
+                {
+                    bool tp_pressed = (raw_report[2 + 9] & 0x02) != 0;
 
-                /* Suppress Create+TP from reaching game */
-                if (create_held && tp_pressed) {
-                    raw_report[2 + DS5_BTN_BYTE] &= ~DS5_BTN_CREATE_BIT;
-                    raw_report[2 + 9] &= ~0x02;
+                    if (create_held && tp_pressed && !tp_mode_combo_fired) {
+                        remap_tp_cycle_mode();
+                        uint8_t new_mode = config_get()->tp_mode;
+                        static const uint8_t mode_blinks[] = {
+                            LED_BLINK_ONCE, LED_BLINK_DOUBLE, LED_BLINK_TRIPLE,
+                            LED_BLINK_TRIPLE, LED_BLINK_TRIPLE, LED_BLINK_TRIPLE
+                        };
+                        led_status_set(mode_blinks[new_mode]);
+                        LOG_INF("[TP] Combo → mode %u\n", new_mode);
+                        tp_mode_combo_fired = true;
+                        create_used_combo = true;
+                    }
+                    if (!create_held || !tp_pressed)
+                        tp_mode_combo_fired = false;
+                    if (create_held && tp_pressed)
+                        raw_report[2 + 9] &= ~0x02;
                 }
+
+                /* Show battery on player LEDs: Create + Mute (one-shot) */
+                {
+                    static bool batt_led_combo_fired = false;
+                    bool mute_pressed = (raw_report[2 + 9] & 0x04) != 0;
+
+                    if (create_held && mute_pressed && !batt_led_combo_fired) {
+                        batt_led_combo_fired = true;
+                        create_used_combo = true;
+                        uint8_t batt = raw_report[2 + DS5_BATT_BYTE_OFFSET];
+                        uint8_t cur_pct = batt & DS5_BATT_LEVEL_MASK;
+
+                        batt_peek_pct = cur_pct;
+
+                        uint8_t payload[DS5_USB_OUTPUT_PAYLOAD_LEN];
+                        memset(payload, 0, sizeof(payload));
+                        payload[1] = 0x14;
+                        payload[43] = battery_to_player_leds(cur_pct);
+                        batt_pct_to_rgb(cur_pct, &payload[44], &payload[45], &payload[46]);
+                        uint8_t buf[DS5_BT_OUTPUT_EXT_SIZE];
+                        build_bt_output_ext(payload, DS5_USB_OUTPUT_PAYLOAD_LEN, buf);
+                        bt_hid_host_send_output(buf, DS5_BT_OUTPUT_EXT_SIZE);
+                        LOG_INF("[BATT-LED] show pct=%d\n", cur_pct);
+                    }
+                    if (!create_held || !mute_pressed)
+                        batt_led_combo_fired = false;
+                    if (create_held && mute_pressed)
+                        raw_report[2 + 9] &= ~0x04;
+                }
+
+                /* Create: suppress while held, inject on release if no combo.
+                 * Skip release-to-send if Create has a keyboard mapping. */
+                bool create_kbd = remap_btn_is_kbd(REMAP_BTN_CREATE);
+                if (create_held) {
+                    if (!create_prev)
+                        create_press_start_us = bflb_mtimer_get_time_us();
+                    if (!create_kbd) {
+                        if (create_used_combo || (bflb_mtimer_get_time_us() - create_press_start_us) < COMBO_WINDOW_US) {
+                            raw_report[2 + DS5_BTN_BYTE] &= ~DS5_BTN_CREATE_BIT;
+                        } else {
+                            create_past_window = true;
+                        }
+                    }
+                    create_inject_us = 0;
+                } else if (create_prev) {
+                    if (!create_kbd && !create_used_combo && !create_past_window)
+                        create_inject_us = bflb_mtimer_get_time_us() + RELEASE_INJECT_MS * 1000ULL;
+                    create_used_combo = false;
+                    create_past_window = false;
+                }
+                if (!create_held && create_inject_us) {
+                    if (bflb_mtimer_get_time_us() < create_inject_us)
+                        raw_report[2 + DS5_BTN_BYTE] |= DS5_BTN_CREATE_BIT;
+                    else
+                        create_inject_us = 0;
+                }
+                create_prev = create_held;
             }
 
             if (!vol_key_active)
@@ -1263,6 +1532,22 @@ static void usb_task(void *arg)
                         led_status_set(LED_OFF);
                     else
                         led_status_set(LED_GREEN_SOLID);
+                }
+
+                if (config_get()->battery_led) {
+                    bool game_owns_led = game_player_led_us &&
+                        (bflb_mtimer_get_time_us() - game_player_led_us <
+                         GAME_PLAYER_LED_TIMEOUT_US);
+                    if (!game_owns_led) {
+                        if (game_player_led_us) {
+                            game_player_led_us = 0;
+                            last_batt_led_pct = 0xFF;
+                        }
+                        if (pct != last_batt_led_pct) {
+                            last_batt_led_pct = pct;
+                            send_battery_led(pct);
+                        }
+                    }
                 }
 
                 uint8_t inact_min = config_inactive_minutes();
@@ -1411,7 +1696,7 @@ int main(void)
     easyflash_init();
     if (rfparam_init(0, NULL, 0) != 0)
         LOG_ERR("[B] RF init FAIL\n");
-    bflb_mtimer_delay_ms(3000);
+    bflb_mtimer_delay_ms(1000);
 
     config_load();
     remap_init();

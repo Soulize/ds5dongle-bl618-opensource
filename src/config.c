@@ -16,7 +16,13 @@ void config_validate(void)
 {
     struct config_body *b = &cfg;
 
-    if (b->config_version != CONFIG_VERSION) {
+    if (b->config_version == 2) {
+        b->headset_vol_offset = 0;
+        b->lock_volume = (b->lock_volume == 1) ? 2 : 0;
+        b->config_version = CONFIG_VERSION;
+        LOG_INF("[CFG] Migrated v2→v3: lock_volume=%d\n",
+                b->lock_volume);
+    } else if (b->config_version != CONFIG_VERSION) {
         LOG_WRN("[CFG] Version mismatch (%d vs %d), resetting\n",
                b->config_version, CONFIG_VERSION);
         memset(b, 0xFF, sizeof(*b));
@@ -27,8 +33,8 @@ void config_validate(void)
         b->haptics_gain = 1.0f;
     if (b->speaker_volume > 127)
         b->speaker_volume = 100;
-    if (b->headset_volume > 127)
-        b->headset_volume = 100;
+    if (b->headset_vol_offset > 127)
+        b->headset_vol_offset = 0;
     if (b->speaker_gain > 7)
         b->speaker_gain = 2;
     if (b->inactive_time > 60)
@@ -53,7 +59,7 @@ void config_validate(void)
         b->enable_wake = 1;
     if (b->trigger_reduce > 10)
         b->trigger_reduce = 0;
-    if (b->lock_volume > 1)
+    if (b->lock_volume > 3)
         b->lock_volume = 0;
     if (b->dse_detected > 1)
         b->dse_detected = 0;
@@ -66,14 +72,18 @@ void config_validate(void)
         b->led_g = 0xFF;
         b->led_b = 0xFF;
     }
-    if (b->tp_mode > 4)
+    if (b->tp_mode > 5)
         b->tp_mode = 0;
-    if (b->tp_mode_enabled_mask == 0 || b->tp_mode_enabled_mask > 0x1F)
+    if (b->tp_mode_enabled_mask == 0 || b->tp_mode_enabled_mask > 0x3F)
         b->tp_mode_enabled_mask = 0x01; /* at least mode 0 enabled */
     if (b->tp_mouse_sensitivity == 0 || b->tp_mouse_sensitivity > 32)
         b->tp_mouse_sensitivity = 8;
     if (b->audio_haptic > 2)
         b->audio_haptic = 0;
+    if (b->tp_click_mode > 1)
+        b->tp_click_mode = 0;
+    if (b->battery_led > 1)
+        b->battery_led = 0;
 }
 
 void config_load(void)
@@ -88,7 +98,7 @@ void config_load(void)
         cfg.config_version    = CONFIG_VERSION;
         cfg.haptics_gain      = 1.0f;
         cfg.speaker_volume    = 100;
-        cfg.headset_volume    = 100;
+        cfg.headset_vol_offset = 0;
         cfg.speaker_gain      = 2;
         cfg.inactive_time     = 30;
         cfg.disable_led       = 1;     /* auto-off LED after 1 min */
@@ -97,6 +107,7 @@ void config_load(void)
         cfg.controller_mode   = 2;     /* Auto */
         cfg.enable_wake       = 0;
         cfg.enable_usb_sn     = 1;     /* DS5Dongle always provides serial */
+        cfg.lock_volume       = 0;     /* default: off */
         cfg.usb_stealth       = 0;     /* USB visible at boot (non-stealth) */
         cfg.led_r             = 0xFF;
         cfg.led_g             = 0xFF;

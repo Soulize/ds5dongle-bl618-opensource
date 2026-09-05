@@ -21,16 +21,10 @@
 #include "task.h"
 #include "queue.h"
 
-#if defined(BOARD_LCTECH_616)
-  #ifdef FORCE_FS_MODE
-    #define FIRMWARE_VERSION "LCT616-DS5 3.18"
-  #else
-    #define FIRMWARE_VERSION "LCT616-DS5 3.18H"
-  #endif
-#elif defined(BOARD_M0S_DOCK)
-#define FIRMWARE_VERSION "M0S-DS5 3.5"
+#ifdef FIRMWARE_VERSION_STR
+#define FIRMWARE_VERSION FIRMWARE_VERSION_STR
 #else
-#define FIRMWARE_VERSION "BL618-DS5 3.5"
+#define FIRMWARE_VERSION "Unknown"
 #endif
 
 #define USBD_MAX_POWER      250
@@ -41,8 +35,8 @@
 #define USB_HID_ONLY_SIZE (9 + 9 + 7 + USB_KBD_DESC_SIZE)
 #define USB_AUDIO_DESC_SIZE 186
 #define USB_HID_CONFIG_SIZE (9 + USB_AUDIO_DESC_SIZE + USB_HID_ONLY_SIZE)
-#define HID_REPORT_DESC_SIZE_DS  329
-#define HID_REPORT_DESC_SIZE_DSE 445
+#define HID_REPORT_DESC_SIZE_DS  337
+#define HID_REPORT_DESC_SIZE_DSE 453
 #define KBD_REPORT_DESC_SIZE 138  /* Keyboard + Consumer + Mouse */
 
 static bool current_dse_mode = false;
@@ -235,6 +229,10 @@ static const uint8_t hid_report_desc_ds[HID_REPORT_DESC_SIZE_DS] = {
     0x09, 0x3A,
     0x95, 0x3F,
     0xB1, 0x02,
+    0x85, 0xFA,       /*   Report ID (250) — chip ID + token status */
+    0x09, 0x3B,
+    0x95, 0x3F,
+    0xB1, 0x02,
     0x85, 0xFB,       /*   Report ID (251) — button remap table */
     0x09, 0x3C,
     0x95, 0x7F,       /*   Report Count (127) — 31 entries * 4 + header */
@@ -312,6 +310,7 @@ static const uint8_t hid_report_desc_dse[HID_REPORT_DESC_SIZE_DSE] = {
     0x85, 0xF7, 0x09, 0x38, 0x95, 0x3F, 0xB1, 0x02,
     0x85, 0xF8, 0x09, 0x39, 0x95, 0x3F, 0xB1, 0x02,
     0x85, 0xF9, 0x09, 0x3A, 0x95, 0x3F, 0xB1, 0x02,
+    0x85, 0xFA, 0x09, 0x3B, 0x95, 0x3F, 0xB1, 0x02,
     0x85, 0xFB, 0x09, 0x3C, 0x95, 0x7F, 0xB1, 0x02,  /* button remap table (127B) */
     0xC0,
 };
@@ -501,9 +500,26 @@ static const uint8_t *desc_device_cb(uint8_t speed)
     return device_desc;
 }
 
+static void fixup_iso_binterval(uint8_t *desc, uint8_t fs_val, uint8_t hs_val,
+                                bool target_fs)
+{
+    uint16_t total = desc[2] | (desc[3] << 8);
+    for (uint16_t i = 0; i + 2 < total && i + 2 < USB_HID_CONFIG_SIZE; ) {
+        uint8_t len = desc[i];
+        if (len < 2) break;
+        if (desc[i + 1] == 0x05 && len >= 7) {
+            uint8_t bmAttr = desc[i + 3];
+            if ((bmAttr & 0x03) == 0x01)
+                desc[i + 6] = target_fs ? fs_val : hs_val;
+        }
+        i += len;
+    }
+}
+
 static const uint8_t *desc_config_cb(uint8_t speed)
 {
-    (void)speed;
+    fixup_iso_binterval(config_desc, 1, 4,
+                        speed <= USB_SPEED_FULL);
     return config_desc;
 }
 
@@ -526,22 +542,10 @@ static uint8_t other_speed_desc[USB_HID_CONFIG_SIZE];
 
 static const uint8_t *desc_other_speed_cb(uint8_t speed)
 {
-    (void)speed;
     memcpy(other_speed_desc, config_desc, sizeof(other_speed_desc));
     other_speed_desc[1] = 0x07;
-    uint16_t total = other_speed_desc[2] | (other_speed_desc[3] << 8);
-    for (uint16_t i = 0; i + 2 < total && i + 2 < sizeof(other_speed_desc); ) {
-        uint8_t len = other_speed_desc[i];
-        if (len < 2) break;
-        if (other_speed_desc[i + 1] == 0x05 && len >= 7) {
-            uint8_t bmAttr = other_speed_desc[i + 3];
-            if ((bmAttr & 0x03) == 0x01)
-                other_speed_desc[i + 6] = 1;   /* ISO: FS bInterval=1 (1ms) */
-            else if ((bmAttr & 0x03) == 0x03)
-                other_speed_desc[i + 6] = other_speed_desc[i + 6]; /* INT: keep as-is */
-        }
-        i += len;
-    }
+    fixup_iso_binterval(other_speed_desc, 1, 4,
+                        speed > USB_SPEED_FULL);
     return other_speed_desc;
 }
 
@@ -691,6 +695,8 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         audio_set_mic_active(false);
         audio_reset_encoder();
         LOG_INF("[USB-EVT] RESET — host detected device, bus reset sent\n");
+        if (hook_configured)
+            hook_configured();
         break;
     case USBD_EVENT_SUSPEND:
         usb_configured = false;
@@ -770,7 +776,7 @@ void usb_gamepad_process_deferred(void)
     if (frid != 0) {
         pending_feature_rid = 0;
         bt_hid_host_get_feature(frid);
-        LOG_INF("[USB] Deferred GET_REPORT(Feature 0x%02x) → BT\n", frid);
+        LOG_DBG("[USB] Deferred GET_REPORT(Feature 0x%02x) → BT\n", frid);
     }
 
     set_report_entry_t entry;
@@ -1043,7 +1049,7 @@ static uint8_t kbd_idle_report[USB_KBD_EP_MPS];
 
 static bool is_dongle_cmd(uint8_t report_id)
 {
-    return (report_id >= 0xF6 && report_id <= 0xF9) || report_id == 0xFB;
+    return (report_id >= 0xF6 && report_id <= 0xFA) || report_id == 0xFB;
 }
 
 /*
@@ -1156,7 +1162,7 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
             memcpy(feature_resp_buf + 1, cfg, cfg_len);
             *data = feature_resp_buf;
             *len  = 1 + cfg_len;
-            LOG_INF("[USB] GET_REPORT(0xF7) → config %u bytes\n", cfg_len);
+            LOG_DBG("[USB] GET_REPORT(0xF7) → config %u bytes\n", cfg_len);
         } else if (report_id == 0xF8) {
             uint16_t ver_len = strlen(FIRMWARE_VERSION);
             if (ver_len > FEATURE_DATA_MAX)
@@ -1164,7 +1170,7 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
             memcpy(feature_resp_buf + 1, FIRMWARE_VERSION, ver_len);
             *data = feature_resp_buf;
             *len  = 1 + ver_len;
-            LOG_INF("[USB] GET_REPORT(0xF8) → firmware version\n");
+            LOG_DBG("[USB] GET_REPORT(0xF8) → firmware version\n");
         } else if (report_id == 0xF9) {
             extern int8_t bt_hid_host_get_cached_rssi(void);
             extern uint8_t get_battery_level(void);
@@ -1175,15 +1181,13 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
             if (state_mgr_is_spk_active())        aflags |= 0x02;
             if (usb_audio_mic_is_active())         aflags |= 0x01;
             feature_resp_buf[2] = aflags;
-            /* Layout kept identical to the private firmware so the companion
-             * web tool can parse RSSI / audio / battery. OTA fields are
-             * reserved and always zero — this build has no OTA. */
-            feature_resp_buf[3]  = 0;   /* OTA status (idle) */
-            feature_resp_buf[4]  = 0;   /* OTA bytes received */
+            /* OTA fields reserved — always zero in opensource build */
+            feature_resp_buf[3]  = 0;
+            feature_resp_buf[4]  = 0;
             feature_resp_buf[5]  = 0;
             feature_resp_buf[6]  = 0;
             feature_resp_buf[7]  = 0;
-            feature_resp_buf[8]  = 0;   /* OTA total size */
+            feature_resp_buf[8]  = 0;
             feature_resp_buf[9]  = 0;
             feature_resp_buf[10] = 0;
             feature_resp_buf[11] = 0;
@@ -1191,6 +1195,14 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
             feature_resp_buf[13] = get_battery_state();
             *data = feature_resp_buf;
             *len  = 14;
+        } else if (report_id == 0xFA) {
+            uint8_t chipid[8];
+            bflb_efuse_get_chipid(chipid);
+            memcpy(feature_resp_buf + 1, chipid, 8);
+            feature_resp_buf[9] = 0x00;  /* token not supported in opensource */
+            *data = feature_resp_buf;
+            *len  = 10;
+            LOG_DBG("[USB] GET_REPORT(0xFA) → chip ID + token status\n");
         } else if (report_id == 0xFB) {
             feature_resp_buf[0] = 0xFB;
             feature_resp_buf[1] = remap_get_active_profile();
@@ -1200,7 +1212,7 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
                    REMAP_BTN_COUNT * sizeof(remap_entry_t));
             *data = feature_resp_buf;
             *len  = 3 + REMAP_BTN_COUNT * (int)sizeof(remap_entry_t);
-            LOG_INF("[USB] GET_REPORT(0xFB) → profile %d (%d bytes)\n",
+            LOG_DBG("[USB] GET_REPORT(0xFB) → profile %d (%d bytes)\n",
                     remap_read_profile, *len);
         } else {
             *len = 0;
@@ -1225,16 +1237,16 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
         memcpy(feature_resp_buf + 1, cached, cached_len);
         *data = feature_resp_buf;
         *len  = 1 + cached_len;
-        LOG_INF("[USB] GET_REPORT(Feature 0x%02x) → %u bytes from cache\n",
+        LOG_DBG("[USB] GET_REPORT(Feature 0x%02x) → %u bytes from cache\n",
                report_id, cached_len);
     } else if (ds5_feature_fallback(report_id, feature_resp_buf, len)) {
         *data = feature_resp_buf;
-        LOG_INF("[USB] GET_REPORT(Feature 0x%02x) → %u bytes from fallback\n",
+        LOG_DBG("[USB] GET_REPORT(Feature 0x%02x) → %u bytes from fallback\n",
                report_id, *len);
     } else {
         pending_feature_rid = report_id;
         *len = 0;
-        LOG_INF("[USB] GET_REPORT(Feature 0x%02x) → not cached, deferred to task\n",
+        LOG_DBG("[USB] GET_REPORT(Feature 0x%02x) → not cached, deferred to task\n",
                report_id);
     }
 }
@@ -1263,8 +1275,7 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
         if (cmd == 0x01 && payload_len > 1) {
             config_set(payload + 1, payload_len - 1);
             usb_gamepad_set_polling_rate(config_get()->polling_rate_mode);
-            if (config_get()->lock_volume)
-                state_mgr_restore_config_volume();
+            state_mgr_restore_config_volume();
             LOG_INF("[USB] CMD 0x01: config updated\n");
         } else if (cmd == 0x02) {
             usb_config_save_pending = true;

@@ -48,7 +48,7 @@
 #define DS5_BATT_LEVEL_MASK       0x0F
 #define DS5_BATT_STATE_SHIFT      4
 #define DS5_BATT_STATE_DISCHARGE  0x00
-#define DS5_BATT_LOW_THRESHOLD    1    /* PowerPercent <= 1 → ≤ 10% */
+#define DS5_BATT_LOW_THRESHOLD    0    /* PowerPercent == 0 → 0-9% */
 #define DS5_BATT_WARN_THRESHOLD   2    /* PowerPercent <= 2 → ≤ 20% */
 
 #define DS5_BTN_BYTE              8    /* offset in 63-byte USB payload */

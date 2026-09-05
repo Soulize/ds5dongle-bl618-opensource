@@ -211,6 +211,7 @@ void led_status_tick(void)
  *   Waiting/Pairing (purple slow) → LED0 slow blink
  *   Scanning (purple fast)        → LED0 fast blink
  *   Connected (green)             → LED1 solid
+ *   OTA (blue)                    → LED0 + LED1 solid
  *   Disconnect (red blink)        → LED0 + LED1 sync blink
  *   Event ack (blink once)        → LED1 flash once
  *   Bonds cleared (triple)        → LED1 triple flash
@@ -381,6 +382,7 @@ void led_status_tick(void)
  *   Waiting/Pairing (purple slow) → slow blink
  *   Scanning (purple fast)        → fast blink
  *   Connected (green)             → solid
+ *   OTA (blue)                    → solid (same as connected)
  *   Disconnect (red blink)        → medium blink → auto slow blink
  *   Event ack (blink once)        → single flash
  *   Bonds cleared (triple)        → triple flash

@@ -107,6 +107,11 @@ void bt_hid_host_force_disconnect(void);
 int bt_hid_host_send_output(const uint8_t *data, uint16_t len);
 
 /**
+ * Send an audio report (non-blocking, no retry on failure).
+ */
+int bt_hid_host_send_audio(const uint8_t *data, uint16_t len);
+
+/**
  * Send a SET_REPORT (Feature) on the control channel.
  * @param report_id  HID report ID
  * @param data       report payload (after report ID)
@@ -282,6 +287,12 @@ int bt_hid_host_read_rssi(int8_t *rssi);
 int8_t bt_hid_host_get_cached_rssi(void);
 
 /**
+ * Clear the target address filter so inquiry accepts any gamepad.
+ * Call before scan_start when pairing a new (unknown) controller.
+ */
+void bt_hid_host_clear_target(void);
+
+/**
  * Disable page scan + inquiry scan to silence the BT radio.
  * Call when USB host is confirmed offline (e.g. sustained SUSPEND after
  * controller power-off) to reduce power consumption / heat.
@@ -294,5 +305,18 @@ void bt_hid_host_radio_idle(void);
  * Also triggers reconnection attempt. Call from task context only.
  */
 void bt_hid_host_radio_wake(void);
+
+/**
+ * Disable page scan after USB RESUME if already connected.
+ * radio_wake() re-enables 100% duty-cycle page scan which starves
+ * the active ACL link. Call from task context after USB RESUME.
+ */
+void bt_hid_host_on_resume(void);
+
+/**
+ * Ensure page scan is active (idempotent, no logging).
+ * Use in hot loops to guard against radio_idle() disabling it.
+ */
+void bt_hid_host_ensure_connectable(void);
 
 #endif /* BT_HID_HOST_H */

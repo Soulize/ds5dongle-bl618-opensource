@@ -5,6 +5,7 @@
 #include "config.h"
 
 #include "FreeRTOS.h"
+#include "task.h"
 #include "semphr.h"
 #include "queue.h"
 #include "timers.h"
@@ -47,21 +48,26 @@ static uint8_t audio_seq;   /* sequence counter for 0x39 audio report */
  * Upper bounds verified at init via opus_encoder_get_size() / opus_decoder_get_size(). */
 #define OPUS_ENC_MAX_SIZE 36864
 #define OPUS_DEC_MAX_SIZE 24576
-static __attribute__((aligned(8))) uint8_t encoder_mem[OPUS_ENC_MAX_SIZE];
-static __attribute__((aligned(8))) uint8_t decoder_mem[OPUS_DEC_MAX_SIZE];
+static __attribute__((aligned(32))) uint8_t encoder_mem[OPUS_ENC_MAX_SIZE];
+static __attribute__((aligned(32))) uint8_t decoder_mem[OPUS_DEC_MAX_SIZE];
 static OpusEncoder  *encoder;
 static OpusDecoder  *decoder;
 static uint8_t  packet_counter;
 static volatile bool plug_headset;
 static volatile bool mic_enabled;   /* host opened mic interface AND config allows */
 static volatile bool mic_status_pending;  /* deferred: send 0x32 to controller */
-static int encoder_force_channels;
+static int encoder_channels;
+
+/* Profiling timestamps written by celt_encode_with_ec (mcycle CSR) */
+volatile unsigned int opus_prof_ts[16];
 
 static QueueHandle_t mic_queue;
 
-static int16_t  pcm_block[ACCUM_SAMPLES * USB_AUDIO_CHANNELS];
+static __attribute__((aligned(32))) int16_t pcm_block[ACCUM_SAMPLES * USB_AUDIO_CHANNELS];
 
-static int16_t  spk_resamp[OPUS_FRAME_SAMPLES * 2];
+static __attribute__((aligned(32))) int16_t spk_resamp[OPUS_FRAME_SAMPLES * 2];
+static __attribute__((aligned(32))) int16_t mic_dec_mono[OPUS_FRAME_SAMPLES];
+static __attribute__((aligned(32))) int16_t mic_dec_stereo[OPUS_FRAME_SAMPLES * 2];
 static bool     mic_first_frame;
 static volatile bool encoding_in_progress;
 static volatile bool encoder_reset_pending;
@@ -70,15 +76,27 @@ static volatile uint64_t encode_start_us;
 static TaskHandle_t audio_task_handle;
 static TimerHandle_t encode_watchdog;
 
+/* Mic diagnostic counters — feed_cnt/drop are operational (queue logic) */
+static volatile uint32_t mic_feed_cnt  = 0;
+static volatile uint32_t mic_feed_drop = 0;
+static uint32_t mic_dec_tick = 0;
+#if LOG_LEVEL >= 3
+static uint32_t mic_dec_ok = 0, mic_dec_err = 0;
+static uint64_t mic_dec_sum_us = 0;
+static int16_t  mic_dec_peak = 0;
+#endif
+
 /* Double-frame buffers for 0x39 report (2x haptics + 2x opus per packet) */
-static uint8_t  opus_slots[2][OPUS_OUT_SIZE];
-static int8_t   haptic_slots[2][HAPTIC_BUF_SIZE];
+static __attribute__((aligned(32))) uint8_t  opus_slots[2][OPUS_OUT_SIZE];
+static __attribute__((aligned(32))) int8_t   haptic_slots[2][HAPTIC_BUF_SIZE];
+
+static bool     silence_ready;
 
 /* Pre-computed polyphase sinc filter in q15 fixed-point.
  * Init uses float for precision; hot path uses int32 MAC only.
  * Coefficients per phase are normalized to sum = 32768 (1.0 in q15),
  * so max accumulator value = 32768 * 32768 = 1,073,741,824 < INT32_MAX. */
-static int16_t sinc_q15[RESAMP_PHASES][SINC_TAPS];
+static __attribute__((aligned(32))) int16_t sinc_q15[RESAMP_PHASES][SINC_TAPS];
 
 static void resamp_sinc_init(void)
 {
@@ -134,9 +152,26 @@ static void resamp_sinc_init(void)
     }
 }
 
-/* ---- Polyphase sinc resample 512 -> 480 (4ch USB PCM -> stereo, q15) ---- */
-static void resample_512_480(const int16_t *in, int16_t *out)
+/* De-interleaved buffers for SIMD-friendly resample (contiguous L and R) */
+static int16_t resamp_l[HALF_ACCUM];
+static int16_t resamp_r[HALF_ACCUM];
+
+/* Extract L/R from 4ch USB PCM into contiguous arrays */
+static void deinterleave_4ch(const int16_t *in, int n)
 {
+    for (int i = 0; i < n; i++) {
+        resamp_l[i] = in[i * USB_AUDIO_CHANNELS];
+        resamp_r[i] = in[i * USB_AUDIO_CHANNELS + 1];
+    }
+}
+
+/* ---- Polyphase sinc resample 512 -> 480 with E907 kmda SIMD ----
+ * Input: de-interleaved L/R arrays (contiguous int16), stride 1.
+ * 8 taps processed as 4 × kmda (2 taps per instruction). */
+__attribute__((section(".tcm_code")))
+static void resample_512_480(const int16_t *in_unused, int16_t *out, int mono)
+{
+    (void)in_unused;
     for (int i = 0; i < OPUS_FRAME_SAMPLES; i++) {
         uint32_t src_pos = (uint32_t)i * 16;
         int center = (int)(src_pos / RESAMP_PHASES);
@@ -148,22 +183,44 @@ static void resample_512_480(const int16_t *in, int16_t *out)
 
         if (center >= SINC_HALF_TAPS - 1 &&
             center <= HALF_ACCUM - SINC_HALF_TAPS - 1) {
-            const int16_t *s = in +
-                (center - (SINC_HALF_TAPS - 1)) * USB_AUDIO_CHANNELS;
-#define RESAMP_TAP(t) do { \
-                int16_t coeff = c[(t)]; \
-                sum_l += (int32_t)s[(t) * USB_AUDIO_CHANNELS] * coeff; \
-                sum_r += (int32_t)s[(t) * USB_AUDIO_CHANNELS + 1] * coeff; \
-            } while (0)
-            RESAMP_TAP(0);
-            RESAMP_TAP(1);
-            RESAMP_TAP(2);
-            RESAMP_TAP(3);
-            RESAMP_TAP(4);
-            RESAMP_TAP(5);
-            RESAMP_TAP(6);
-            RESAMP_TAP(7);
-#undef RESAMP_TAP
+            int base = center - (SINC_HALF_TAPS - 1);
+            const int16_t *sl = &resamp_l[base];
+            const int16_t *sr = &resamp_r[base];
+
+#if defined(E907_OPUS_DSP)
+            int32_t p;
+            __asm__ volatile("kmda %0, %1, %2" : "=r"(p)
+                : "r"(*(const int32_t *)&sl[0]), "r"(*(const int32_t *)&c[0]));
+            sum_l += p;
+            __asm__ volatile("kmda %0, %1, %2" : "=r"(p)
+                : "r"(*(const int32_t *)&sl[2]), "r"(*(const int32_t *)&c[2]));
+            sum_l += p;
+            __asm__ volatile("kmda %0, %1, %2" : "=r"(p)
+                : "r"(*(const int32_t *)&sl[4]), "r"(*(const int32_t *)&c[4]));
+            sum_l += p;
+            __asm__ volatile("kmda %0, %1, %2" : "=r"(p)
+                : "r"(*(const int32_t *)&sl[6]), "r"(*(const int32_t *)&c[6]));
+            sum_l += p;
+
+            __asm__ volatile("kmda %0, %1, %2" : "=r"(p)
+                : "r"(*(const int32_t *)&sr[0]), "r"(*(const int32_t *)&c[0]));
+            sum_r += p;
+            __asm__ volatile("kmda %0, %1, %2" : "=r"(p)
+                : "r"(*(const int32_t *)&sr[2]), "r"(*(const int32_t *)&c[2]));
+            sum_r += p;
+            __asm__ volatile("kmda %0, %1, %2" : "=r"(p)
+                : "r"(*(const int32_t *)&sr[4]), "r"(*(const int32_t *)&c[4]));
+            sum_r += p;
+            __asm__ volatile("kmda %0, %1, %2" : "=r"(p)
+                : "r"(*(const int32_t *)&sr[6]), "r"(*(const int32_t *)&c[6]));
+            sum_r += p;
+#else
+            for (int t = 0; t < SINC_TAPS; t++) {
+                int16_t coeff = c[t];
+                sum_l += (int32_t)sl[t] * coeff;
+                sum_r += (int32_t)sr[t] * coeff;
+            }
+#endif
         } else {
             for (int t = 0; t < SINC_TAPS; t++) {
                 int idx = center + t - (SINC_HALF_TAPS - 1);
@@ -171,18 +228,23 @@ static void resample_512_480(const int16_t *in, int16_t *out)
                 if (idx >= HALF_ACCUM) idx = HALF_ACCUM - 1;
 
                 int16_t coeff = c[t];
-                sum_l += (int32_t)in[idx * USB_AUDIO_CHANNELS] * coeff;
-                sum_r += (int32_t)in[idx * USB_AUDIO_CHANNELS + 1] * coeff;
+                sum_l += (int32_t)resamp_l[idx] * coeff;
+                sum_r += (int32_t)resamp_r[idx] * coeff;
             }
         }
 
-        int32_t l = sum_l >> 15;
-        int32_t r = sum_r >> 15;
-        if (l > 32767) l = 32767; if (l < -32768) l = -32768;
-        if (r > 32767) r = 32767; if (r < -32768) r = -32768;
-
-        out[i * 2]     = (int16_t)l;
-        out[i * 2 + 1] = (int16_t)r;
+        if (mono) {
+            int32_t m = (sum_l + sum_r) >> 16;
+            if (m > 32767) m = 32767; if (m < -32768) m = -32768;
+            out[i] = (int16_t)m;
+        } else {
+            int32_t l = sum_l >> 15;
+            int32_t r = sum_r >> 15;
+            if (l > 32767) l = 32767; if (l < -32768) l = -32768;
+            if (r > 32767) r = 32767; if (r < -32768) r = -32768;
+            out[i * 2]     = (int16_t)l;
+            out[i * 2 + 1] = (int16_t)r;
+        }
     }
 }
 
@@ -316,7 +378,7 @@ static int send_audio_report(void)
     ds5_write_le32(&pkt[DS5_BT_AUDIO_REPORT_SIZE - 4], crc);
 
     static uint32_t fail_log_count = 0;
-    int ret = bt_hid_host_send_output(pkt, DS5_BT_AUDIO_REPORT_SIZE);
+    int ret = bt_hid_host_send_audio(pkt, DS5_BT_AUDIO_REPORT_SIZE);
     if (ret) {
         fail_log_count++;
         if (fail_log_count <= 3 || (fail_log_count % 100) == 0)
@@ -391,7 +453,7 @@ int audio_init(void)
     }
 
     encoder = (OpusEncoder *)encoder_mem;
-    err = opus_encoder_init(encoder, 48000, 2,
+    err = opus_encoder_init(encoder, 48000, 1,
                             OPUS_APPLICATION_RESTRICTED_CELT);
     if (err != OPUS_OK) {
         LOG_ERR("[AUDIO] Opus encoder init failed: %d\n", err);
@@ -400,11 +462,12 @@ int audio_init(void)
     }
 
     opus_encoder_ctl(encoder, OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
-    opus_encoder_ctl(encoder, OPUS_SET_BITRATE(200 * 8 * 100));
-    opus_encoder_ctl(encoder, OPUS_SET_VBR(0));
+    opus_encoder_ctl(encoder, OPUS_SET_BITRATE(128000));
+    opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
     opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
-    opus_encoder_ctl(encoder, OPUS_SET_FORCE_CHANNELS(1));
-    encoder_force_channels = 1;
+    opus_encoder_ctl(encoder, OPUS_SET_PREDICTION_DISABLED(1));
+    opus_encoder_ctl(encoder, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_SUPERWIDEBAND));
+    encoder_channels = 1;
 
     decoder = (OpusDecoder *)decoder_mem;
     err = opus_decoder_init(decoder, 48000, MIC_CHANNELS);
@@ -484,37 +547,64 @@ void audio_task(void *arg)
     LOG_INF("[AUDIO] Task started\n");
 
     uint32_t send_fail_streak = 0;
+    uint32_t send_cnt = 0;
+#if LOG_LEVEL >= 3
+    uint64_t last_send_us = 0;
+    uint32_t send_jitter_cnt = 0;
+    uint64_t send_sum_interval = 0;
+    uint64_t send_sum_enc = 0;
+    uint64_t psum_haptic = 0, psum_resamp = 0;
+    uint64_t psum_opus = 0, psum_send = 0;
+#endif
 
     for (;;) {
-        if (xSemaphoreTake(sem, pdMS_TO_TICKS(25)) == pdTRUE) {
+        TickType_t wait = pdMS_TO_TICKS(25);
+        if (xSemaphoreTake(sem, wait) == pdTRUE) {
             bool a_active = usb_audio_is_active();
             bool a_read   = a_active ? usb_audio_read(pcm_block) : false;
             bool a_bt     = bt_hid_host_get_state() == BT_HID_STATE_CONNECTED;
 
             if (a_active && a_read && a_bt)
             {
+                uint64_t cycle_start = bflb_mtimer_get_time_us();
                 bool speaker_on = !config_get()->disable_speaker;
                 int target_channels = plug_headset ? 2 : 1;
 
-                if (target_channels != encoder_force_channels) {
-                    int ctl_err = opus_encoder_ctl(
-                        encoder, OPUS_SET_FORCE_CHANNELS(target_channels));
-                    if (ctl_err == OPUS_OK) {
-                        encoder_force_channels = target_channels;
+                if (target_channels != encoder_channels) {
+                    int reinit_err = opus_encoder_init(
+                        encoder, 48000, target_channels,
+                        OPUS_APPLICATION_RESTRICTED_CELT);
+                    if (reinit_err == OPUS_OK) {
+                        opus_encoder_ctl(encoder, OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
+                        opus_encoder_ctl(encoder, OPUS_SET_BITRATE(128000));
+                        opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
+                        opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
+                        opus_encoder_ctl(encoder, OPUS_SET_PREDICTION_DISABLED(1));
+                        opus_encoder_ctl(encoder, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_SUPERWIDEBAND));
+                        encoder_channels = target_channels;
+                        LOG_INF("[AUDIO] Encoder reinit %dch\n", target_channels);
                     } else {
-                        LOG_ERR("[AUDIO] Opus force %s failed: %d\n",
-                                target_channels == 1 ? "mono" : "stereo",
-                                ctl_err);
+                        LOG_ERR("[AUDIO] Encoder reinit %dch failed: %d\n",
+                                target_channels, reinit_err);
                     }
                 }
 
                 uint8_t ah_mode = config_get()->audio_haptic;
+
+
+#if LOG_LEVEL >= 3
+                uint64_t prof_haptic = 0, prof_resamp = 0;
+                uint64_t prof_opus = 0;
+#endif
 
                 for (int slot = 0; slot < 2; slot++) {
                     const uint32_t base = (uint32_t)slot * HALF_ACCUM;
                     const int16_t *slot_pcm =
                         &pcm_block[base * USB_AUDIO_CHANNELS];
 
+#if LOG_LEVEL >= 3
+                    uint64_t t_hap0 = bflb_mtimer_get_time_us();
+#endif
                     if (ah_mode == 2) {
                         audio_to_haptic(slot_pcm, haptic_slots[slot], HALF_ACCUM);
                     } else if (ah_mode == 1 &&
@@ -523,14 +613,29 @@ void audio_task(void *arg)
                     } else {
                         decimate_haptics(slot_pcm, haptic_slots[slot], HALF_ACCUM);
                     }
+#if LOG_LEVEL >= 3
+                    prof_haptic += bflb_mtimer_get_time_us() - t_hap0;
+#endif
 
                     if (speaker_on) {
-                        resample_512_480(slot_pcm, spk_resamp);
+#if LOG_LEVEL >= 3
+                        uint64_t t_res0 = bflb_mtimer_get_time_us();
+#endif
+                        deinterleave_4ch(slot_pcm, HALF_ACCUM);
+                        int mono = (encoder_channels == 1);
+                        resample_512_480(slot_pcm, spk_resamp, mono);
+#if LOG_LEVEL >= 3
+                        prof_resamp += bflb_mtimer_get_time_us() - t_res0;
+#endif
+
                         encode_start_us = bflb_mtimer_get_time_us();
                         encoding_in_progress = true;
                         int encoded = opus_encode(encoder, spk_resamp, OPUS_FRAME_SAMPLES,
                                                   opus_slots[slot], OPUS_OUT_SIZE);
                         encoding_in_progress = false;
+#if LOG_LEVEL >= 3
+                        prof_opus += bflb_mtimer_get_time_us() - encode_start_us;
+#endif
 
                         if (encoder_reset_pending) {
                             encoder_reset_pending = false;
@@ -540,15 +645,26 @@ void audio_task(void *arg)
                             LOG_ERR("[AUDIO] Opus encode error: %d\n", encoded);
                             memset(opus_slots[slot], 0, OPUS_OUT_SIZE);
                         } else if (encoded < OPUS_OUT_SIZE) {
-                            memset(opus_slots[slot] + encoded, 0,
-                                   OPUS_OUT_SIZE - encoded);
+                            int pad_ret = opus_packet_pad(
+                                opus_slots[slot], encoded, OPUS_OUT_SIZE);
+                            if (pad_ret != OPUS_OK)
+                                memset(opus_slots[slot] + encoded, 0,
+                                       OPUS_OUT_SIZE - encoded);
                         }
                     } else {
                         memset(opus_slots[slot], 0, OPUS_OUT_SIZE);
                     }
+
+                    if (slot == 0 && mic_enabled)
+                        vTaskDelay(pdMS_TO_TICKS(1));
                 }
 
-                if (send_audio_report() != 0) {
+#if LOG_LEVEL >= 3
+                uint64_t t_send0 = bflb_mtimer_get_time_us();
+#endif
+                int send_ret = send_audio_report();
+
+                if (send_ret != 0) {
                     send_fail_streak++;
                     if (send_fail_streak >= AUDIO_SEND_FAIL_MAX) {
                         LOG_ERR("[AUDIO] %u consecutive send failures, "
@@ -556,14 +672,73 @@ void audio_task(void *arg)
                                 (unsigned)send_fail_streak);
                         send_fail_streak = 0;
                         bt_hid_host_disconnect();
-                    } else if (send_fail_streak > 3) {
-                        vTaskDelay(pdMS_TO_TICKS(20));
-                    } else {
-                        vTaskDelay(1);
                     }
                 } else {
                     send_fail_streak = 0;
                 }
+
+                send_cnt++;
+
+#if LOG_LEVEL >= 3
+                {
+                    uint64_t cycle_end = bflb_mtimer_get_time_us();
+                    uint32_t prof_send = (uint32_t)(cycle_end - t_send0);
+                    uint32_t enc_us = (uint32_t)(cycle_end - cycle_start);
+                    send_sum_enc += enc_us;
+                    psum_haptic += prof_haptic;
+                    psum_resamp += prof_resamp;
+                    psum_opus += prof_opus;
+                    psum_send += prof_send;
+
+                    uint32_t interval_us = 0;
+                    if (last_send_us > 0) {
+                        interval_us = (uint32_t)(cycle_start - last_send_us);
+                        send_sum_interval += interval_us;
+                        if (interval_us < 19000 || interval_us > 23000)
+                            send_jitter_cnt++;
+                    }
+                    last_send_us = cycle_start;
+
+                    if (send_cnt <= 10 || send_cnt % 2000 == 0) {
+                        if (send_cnt > 1) {
+                            uint32_t avg_iv = (uint32_t)(send_sum_interval / (send_cnt - 1));
+                            uint32_t avg_enc = (uint32_t)(send_sum_enc / send_cnt);
+                            LOG_DBG("[AT] #%u sem=%uus enc=%uus | avg_sem=%uus avg_enc=%uus jit=%u mic=%d\n",
+                                   send_cnt, interval_us, enc_us,
+                                   avg_iv, avg_enc, send_jitter_cnt,
+                                   mic_enabled ? 1 : 0);
+                        }
+                        LOG_DBG("[ENC-PROF] #%u haptic=%uus resamp=%uus opus=%uus send=%uus\n",
+                               send_cnt,
+                               (uint32_t)(psum_haptic / send_cnt),
+                               (uint32_t)(psum_resamp / send_cnt),
+                               (uint32_t)(psum_opus / send_cnt),
+                               (uint32_t)(psum_send / send_cnt));
+#ifdef OPUS_ENCODE_PROFILING
+                        {
+                            unsigned int d_pre  = opus_prof_ts[4] - opus_prof_ts[0];
+                            unsigned int d_tone = opus_prof_ts[5] - opus_prof_ts[4];
+                            unsigned int d_wind = opus_prof_ts[7] - opus_prof_ts[5];
+                            unsigned int d_fft  = opus_prof_ts[6] - opus_prof_ts[7];
+                            unsigned int d_be   = opus_prof_ts[1] - opus_prof_ts[6];
+                            unsigned int d_band = opus_prof_ts[2] - opus_prof_ts[1];
+                            unsigned int d_pvq  = opus_prof_ts[3] - opus_prof_ts[2];
+                            unsigned int dtot   = opus_prof_ts[3] - opus_prof_ts[0];
+                            unsigned int d_wrap1 = opus_prof_ts[9] - opus_prof_ts[8];
+                            unsigned int d_dc    = opus_prof_ts[11] - opus_prof_ts[10];
+                            unsigned int d_setup = opus_prof_ts[12] - opus_prof_ts[9];
+                            unsigned int d_cinit = opus_prof_ts[0] - opus_prof_ts[12];
+                            unsigned int d_cpost = opus_prof_ts[13] - opus_prof_ts[3];
+                            LOG_DBG("[CELT-PROF] pre=%u tone=%u wind=%u fft=%u be=%u band=%u pvq=%u tot=%uus\n",
+                                   d_pre/320, d_tone/320, d_wind/320,
+                                   d_fft/320, d_be/320, d_band/320, d_pvq/320, dtot/320);
+                            LOG_DBG("[WRAP-PROF] native=%u dc=%u setup=%u cinit=%u cpost=%uus\n",
+                                   d_wrap1/320, d_dc/320, d_setup/320, d_cinit/320, d_cpost/320);
+                        }
+#endif
+                    }
+                }
+#endif
             }
         }
 
@@ -620,9 +795,11 @@ void audio_mic_feed(const uint8_t *opus_data, uint16_t len)
     if (!mic_enabled || !mic_queue) return;
     if (len < MIC_OPUS_SIZE) return;
 
+    mic_feed_cnt++;
     uint8_t frame[MIC_OPUS_SIZE];
     memcpy(frame, opus_data, MIC_OPUS_SIZE);
     if (xQueueSend(mic_queue, frame, 0) != pdTRUE) {
+        mic_feed_drop++;
         uint8_t discard[MIC_OPUS_SIZE];
         xQueueReceive(mic_queue, discard, 0);
         xQueueSend(mic_queue, frame, 0);
@@ -640,47 +817,82 @@ bool audio_mic_active(void)
     return mic_enabled;
 }
 
-/* ---- Mic decode task: runs independently at lower priority than audio_task ----
- * Blocks on mic_queue so it doesn't burn CPU when mic is inactive.
- * Decodes one Opus frame per wakeup → writes to USB mic ring buffer.
- * Keeps audio_task cycle at ~21ms regardless of mic decoding cost. */
-__attribute__((section(".tcm_code")))
+/* Mic decode at P3 — bt_task(P4) can preempt during gameplay. */
 void audio_mic_task(void *arg)
 {
     (void)arg;
-    static uint8_t  mic_opus_buf[MIC_OPUS_SIZE];
-    static int16_t  mic_mono[OPUS_FRAME_SAMPLES];
-    static int16_t  mic_stereo[OPUS_FRAME_SAMPLES * 2];
+    uint8_t mbuf[MIC_OPUS_SIZE];
 
     for (;;) {
-        if (!mic_queue) {
-            vTaskDelay(pdMS_TO_TICKS(10));
+        if (!mic_enabled || !decoder || !mic_queue) {
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
-        if (xQueueReceive(mic_queue, mic_opus_buf, portMAX_DELAY) != pdTRUE)
+        if (xQueueReceive(mic_queue, mbuf, pdMS_TO_TICKS(50)) != pdTRUE)
             continue;
 
-        if (!decoder || !mic_enabled)
-            continue;
+#if LOG_LEVEL >= 3
+        uint64_t t0 = bflb_mtimer_get_time_us();
+#endif
+        int decoded = opus_decode(decoder, mbuf, MIC_OPUS_SIZE,
+                                  mic_dec_mono, OPUS_FRAME_SAMPLES, 0);
 
-        int decoded = opus_decode(decoder, mic_opus_buf, MIC_OPUS_SIZE,
-                                  mic_mono, OPUS_FRAME_SAMPLES, 0);
         if (decoded <= 0) {
+#if LOG_LEVEL >= 3
+            mic_dec_err++;
+#endif
             LOG_ERR("[MIC] Opus decode error: %d\n", decoded);
-            continue;
-        }
-        if (!mic_first_frame) {
-            mic_first_frame = true;
-            LOG_INF("[AUDIO] First mic frame decoded (%d samples)\n", decoded);
+        } else {
+#if LOG_LEVEL >= 3
+            mic_dec_ok++;
+            mic_dec_sum_us += bflb_mtimer_get_time_us() - t0;
+#endif
+
+            if (!mic_first_frame) {
+                mic_first_frame = true;
+                LOG_INF("[AUDIO] First mic frame decoded (%d samples)\n",
+                        decoded);
+            }
+
+            uint32_t *out32 = (uint32_t *)mic_dec_stereo;
+#if LOG_LEVEL >= 3
+            if (mic_dec_tick < 5 || mic_dec_tick % 100 == 0) {
+                int16_t local_peak = 0;
+                for (int i = 0; i < decoded; i++) {
+                    int16_t s = mic_dec_mono[i];
+                    int16_t v = s < 0 ? -s : s;
+                    if (v > local_peak) local_peak = v;
+                    uint16_t us = (uint16_t)s;
+                    out32[i] = (uint32_t)us | ((uint32_t)us << 16);
+                }
+                if (local_peak > mic_dec_peak) mic_dec_peak = local_peak;
+            } else
+#endif
+            {
+                for (int i = 0; i < decoded; i++) {
+                    uint16_t s = (uint16_t)mic_dec_mono[i];
+                    out32[i] = (uint32_t)s | ((uint32_t)s << 16);
+                }
+            }
+            usb_audio_mic_write(mic_dec_stereo, (uint32_t)decoded);
         }
 
-        /* Pack mono → stereo via uint32: one 32-bit write per sample (LE). */
-        uint32_t *out32 = (uint32_t *)mic_stereo;
-        for (int i = 0; i < decoded; i++) {
-            uint16_t s = (uint16_t)mic_mono[i];
-            out32[i] = (uint32_t)s | ((uint32_t)s << 16);
+        mic_dec_tick++;
+#if LOG_LEVEL >= 3
+        if (mic_dec_tick <= 5 || mic_dec_tick % 2000 == 0) {
+            uint32_t avg = mic_dec_ok
+                         ? (uint32_t)(mic_dec_sum_us / mic_dec_ok) : 0;
+            uint32_t s_cnt, s_under, s_zero;
+            usb_audio_mic_diag(&s_cnt, &s_under, &s_zero);
+            LOG_DBG("[MIC-DIAG] #%u feed=%u drop=%u | dec_ok=%u err=%u "
+                   "avg=%uus peak=%d | usb=%u under=%u zero=%u\n",
+                   mic_dec_tick, mic_feed_cnt, mic_feed_drop,
+                   mic_dec_ok, mic_dec_err, avg, mic_dec_peak,
+                   s_cnt, s_under, s_zero);
+            mic_dec_ok = 0; mic_dec_err = 0;
+            mic_dec_sum_us = 0; mic_dec_peak = 0;
         }
-        usb_audio_mic_write(mic_stereo, (uint32_t)decoded);
+#endif
     }
 }

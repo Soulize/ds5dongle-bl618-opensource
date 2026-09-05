@@ -13,7 +13,7 @@ struct __attribute__((packed)) config_body {
     uint8_t config_version;
     float   haptics_gain;         /* [1.0,2.0]  — haptics amplitude scaling */
     uint8_t speaker_volume;       /* [0,127]    — speaker volume level */
-    uint8_t headset_volume;       /* [0,127]    — headset volume level */
+    uint8_t headset_vol_offset;   /* [0,127]    — headset volume reduction from speaker */
     uint8_t speaker_gain;         /* [0,7]      — speaker gain (SpeakerCompPreGain) */
     uint8_t inactive_time;        /* [0,60] min  (0 = disable) */
     uint8_t disable_led;          /* bool */
@@ -26,7 +26,7 @@ struct __attribute__((packed)) config_body {
     uint8_t disable_speaker;      /* bool       — disable Opus speaker encoding */
     uint8_t enable_wake;          /* bool */
     uint8_t trigger_reduce;       /* [0,10]     — trigger motor power reduction */
-    uint8_t lock_volume;          /* bool       — ignore host volume changes */
+    uint8_t lock_volume;          /* 0=off, 1=block audio routing, 2=lock volume, 3=full lock */
     uint8_t dse_detected;         /* bool — Auto mode remembers last detection */
     uint8_t usb_stealth;          /* bool — hide USB until BT controller connects */
     uint8_t led_r;                /* [0-255] custom LED red   (0xFF = default white) */
@@ -36,9 +36,11 @@ struct __attribute__((packed)) config_body {
     uint8_t tp_mode_enabled_mask; /* bitmask of enabled modes (bit0-bit4) */
     uint8_t tp_mouse_sensitivity; /* [1-32], default 8 */
     uint8_t audio_haptic;         /* 0=off, 1=auto(game priority), 2=force */
+    uint8_t tp_click_mode;        /* 0=touch triggers dirs, 1=click required */
+    uint8_t battery_led;          /* bool — show battery level on player LEDs */
 };
 
-#define CONFIG_VERSION  2
+#define CONFIG_VERSION  3
 
 void config_load(void);
 bool config_save(void);
@@ -59,5 +61,10 @@ static inline bool config_speaker_disabled(void)    { return config_get()->disab
 static inline bool config_mic_disabled(void)         { return config_get()->disable_mic; }
 static inline uint8_t config_audio_buf_len(void)    { return config_get()->audio_buffer_length; }
 static inline bool config_usb_stealth(void)         { return config_get()->usb_stealth; }
+static inline uint8_t config_apply_hp_offset(uint8_t base)
+{
+    uint8_t off = config_get()->headset_vol_offset;
+    return (base > off) ? base - off : 0;
+}
 
 #endif /* CONFIG_H */

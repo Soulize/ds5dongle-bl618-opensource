@@ -19,9 +19,10 @@
 #include "task.h"
 #include "semphr.h"
 #include "bl616_glb.h"
+#include "bflb_mtimer.h"
 
 
-#define BT_INQUIRY_LEN         5
+#define BT_INQUIRY_LEN         3   /* 3 × 1.28s = 3.84s max; poll_scan_early terminates sooner */
 #define BT_MAX_DISCOVERED      8
 #define L2CAP_BR_MTU           672
 
@@ -246,6 +247,7 @@ static struct {
     volatile uint8_t handshake_count;
     volatile uint8_t handshake_next;
     volatile bool handshake_send_failed;
+    volatile uint64_t handshake_sent_us;
 
     bt_hid_input_cb_t  input_cb;
     bt_hid_state_cb_t  state_cb;
@@ -264,7 +266,27 @@ struct net_buf_pool hid_tx_pool;
 struct net_buf_pool hid_rx_pool;
 
 static bool first_intr_logged = false;
+/* Post-wake BT rate diagnostic: L2CAP input inter-arrival. */
+static uint64_t l2_diag_last_us = 0;
+static uint32_t l2_diag_cnt = 0;
+static uint64_t l2_slow_last_log_us = 0;
+static uint32_t l2_slow_since_log = 0;
+static bool page_scan_fallback_fired = false;
 static bool first_output_logged = false;
+
+/*
+ * Raw HCI Write_Scan_Enable — bypasses Zephyr's bt_br_set_connectable()
+ * state cache. Use when the stack API returns -69 after force-disconnect.
+ * 0x00 = no scan, 0x01 = inquiry only, 0x02 = page only, 0x03 = both.
+ */
+static int hci_raw_write_scan_enable(uint8_t mode)
+{
+    struct net_buf *buf = bt_hci_cmd_create(
+        BT_OP(BT_OGF_BASEBAND, 0x001a), 1);
+    if (!buf) return -ENOMEM;
+    net_buf_add_u8(buf, mode);
+    return bt_hci_cmd_send_sync(BT_OP(BT_OGF_BASEBAND, 0x001a), buf, NULL);
+}
 
 /* ---------- Application-level TX FIFO (CAN_SEND_NOW equivalent) ----------
  *
@@ -339,6 +361,27 @@ static void hid_tx_drain_one(void)
     /* On success: app_tx_busy stays true until on_hid_output_sent fires */
 }
 
+/* ---- Audio TX (direct send, no blocking on failure) ---- */
+int bt_hid_host_send_audio(const uint8_t *data, uint16_t len)
+{
+    if (!hid_ctx.intr_connected || !hid_ctx.conn)
+        return -1;
+
+    struct net_buf *buf = net_buf_alloc(&hid_tx_pool, K_NO_WAIT);
+    if (!buf)
+        return -ENOMEM;
+    net_buf_reserve(buf, BT_L2CAP_CHAN_SEND_RESERVE);
+    net_buf_add_u8(buf, HID_HEADER(HID_TRANS_DATA, HID_REPORT_OUTPUT));
+    net_buf_add_mem(buf, data, len);
+
+    int err = bt_l2cap_chan_send(&hid_ctx.intr_chan.chan, buf);
+    if (err < 0) {
+        net_buf_unref(buf);
+        return err;
+    }
+    return 0;
+}
+
 static void app_tx_fifo_reset(void)
 {
     app_tx_head = 0;
@@ -405,11 +448,14 @@ static void handshake_send_next(void)
     if (hid_ctx.state != BT_HID_STATE_HANDSHAKE)
         return;
 
+    hid_ctx.handshake_sent_us = 0;
+
     if (hid_ctx.handshake_next < hid_ctx.handshake_count) {
         uint8_t rid = hid_ctx.handshake_ids[hid_ctx.handshake_next];
         if (bt_hid_host_get_feature(rid) == 0) {
             hid_ctx.handshake_next++;
             hid_ctx.handshake_send_failed = false;
+            hid_ctx.handshake_sent_us = bflb_mtimer_get_time_us();
         } else {
             hid_ctx.handshake_send_failed = true;
             LOG_ERR("[HID] GET_REPORT(0x%02x) send failed, will retry\n", rid);
@@ -500,6 +546,43 @@ static int l2cap_intr_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
             LOG_INF("[HID] First input report from controller: len=%d rid=0x%02x\n",
                    len - 1, data[1]);
         }
+        /* L2 gap monitor: detect sustained SLOW (>10ms) gaps that
+         * indicate radio contention. Logs at most 1 SLOW line/sec.
+         * If density >20/s, forces page scan OFF as fallback. */
+        {
+            uint64_t now = bflb_mtimer_get_time_us();
+            if (l2_diag_last_us != 0) {
+                uint32_t gap = (uint32_t)(now - l2_diag_last_us);
+                l2_diag_cnt++;
+                if (gap > 10000) {
+                    l2_slow_since_log++;
+                    if (l2_slow_last_log_us == 0 ||
+                        now - l2_slow_last_log_us >= 1000000ULL) {
+                        LOG_INF("[L2-DIAG] #%u gap=%uus SLOW (n=%u/s)\n",
+                               l2_diag_cnt, gap, l2_slow_since_log);
+                        if (!page_scan_fallback_fired &&
+                            l2_slow_since_log > 20) {
+                            page_scan_fallback_fired = true;
+                            int c = bt_br_set_connectable(false);
+                            int d = bt_br_set_discoverable(false);
+                            if (c != 0 || d != 0) {
+                                int raw = hci_raw_write_scan_enable(0x00);
+                                LOG_INF("[BT] FALLBACK: raw scan OFF "
+                                       "(api c=%d d=%d, raw=%d)\n",
+                                       c, d, raw);
+                            } else {
+                                LOG_INF("[BT] FALLBACK: page scan OFF "
+                                       "(SLOW n=%u/s)\n",
+                                       l2_slow_since_log);
+                            }
+                        }
+                        l2_slow_last_log_us = now;
+                        l2_slow_since_log = 0;
+                    }
+                }
+            }
+            l2_diag_last_us = now;
+        }
         if (hid_ctx.input_cb) {
             hid_ctx.input_cb(data + 1, len - 1);
         }
@@ -560,8 +643,15 @@ static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
 
     /* Stop accepting further connections while connected (matches
      * DS5Dongle's gap_connectable_control(false) on HID open). */
-    bt_br_set_connectable(false);
-    bt_br_set_discoverable(false);
+    {
+        int c = bt_br_set_connectable(false);
+        int d = bt_br_set_discoverable(false);
+        if (c != 0 || d != 0) {
+            int raw = hci_raw_write_scan_enable(0x00);
+            LOG_INF("[BT] Page scan OFF: api c=%d d=%d, raw HCI=%d\n",
+                   c, d, raw);
+        }
+    }
 
     /* Shorten the Link Supervision Timeout so the BL618 controller
      * detects a dead link within ~5 s instead of the default ~20 s.
@@ -579,6 +669,7 @@ static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
             LOG_INF("[BT] Write Link Supervision Timeout: handle=0x%04x "
                    "timeout=5s err=%d\n", handle, err);
         }
+
     }
 
     set_state(BT_HID_STATE_HANDSHAKE);
@@ -930,6 +1021,7 @@ static void conn_disconnected(struct bt_conn *conn, uint8_t reason)
     hid_ctx.handshake_next  = 0;
     hid_ctx.handshake_count = 0;
     hid_ctx.handshake_send_failed = false;
+    hid_ctx.handshake_sent_us = 0;
     hid_ctx.security_pending = false;
     hid_ctx.security_done = false;
     hid_ctx.sdp_pending = false;
@@ -937,6 +1029,11 @@ static void conn_disconnected(struct bt_conn *conn, uint8_t reason)
 
     first_intr_logged  = false;
     first_output_logged = false;
+    l2_diag_last_us = 0;
+    l2_diag_cnt = 0;
+    l2_slow_last_log_us = 0;
+    l2_slow_since_log = 0;
+    page_scan_fallback_fired = false;
 
     app_tx_fifo_reset();
 
@@ -1236,7 +1333,7 @@ int bt_hid_host_init(const struct bt_hid_host_config *config)
     hid_ctx.filter_pid = config->target_pid;
     hid_ctx.state      = BT_HID_STATE_IDLE;
 
-    net_buf_init(&hid_tx_pool, 20, BT_L2CAP_BUF_SIZE(L2CAP_BR_MTU), NULL);
+    net_buf_init(&hid_tx_pool, 40, BT_L2CAP_BUF_SIZE(L2CAP_BR_MTU), NULL);
     net_buf_init(&hid_rx_pool, 4, BT_L2CAP_BUF_SIZE(L2CAP_BR_MTU), NULL);
 
     bt_conn_cb_register(&conn_callbacks);
@@ -1671,13 +1768,29 @@ bool bt_hid_host_poll_incoming_l2cap_fallback(void)
     }
 
     /* Neither Control connecting nor connected — controller didn't open L2CAP.
-     * Controller's SDP query may have closed before receiving our response.
-     * Set fallback_retry to actively page controller and open L2CAP from host side
-     * (standard HID Host behavior, same as Pico2W DS5Dongle). */
-    LOG_WRN("[BT] L2CAP fallback: no activity in %dms, retry outgoing\n",
+     * Try opening L2CAP from host side on the existing ACL to avoid a
+     * disconnect-reconnect cycle that can leave the BT controller dirty. */
+    LOG_WRN("[BT] L2CAP fallback: no activity in %dms, opening Control from host\n",
             (int)(elapsed * portTICK_PERIOD_MS));
-    hid_ctx.fallback_retry = true;
-    bt_hid_host_disconnect();
+    hid_ctx.outgoing = true;
+    set_state(BT_HID_STATE_L2CAP_CONTROL);
+
+    memset(&hid_ctx.ctrl_chan, 0, sizeof(hid_ctx.ctrl_chan));
+    memset(&hid_ctx.intr_chan, 0, sizeof(hid_ctx.intr_chan));
+    hid_ctx.ctrl_chan.chan.ops = &ctrl_ops;
+    hid_ctx.ctrl_chan.rx.mtu  = L2CAP_BR_MTU;
+    hid_ctx.intr_chan.chan.ops = &intr_ops;
+    hid_ctx.intr_chan.rx.mtu  = L2CAP_BR_MTU;
+
+    int err = bt_l2cap_chan_connect(hid_ctx.conn,
+                                    &hid_ctx.ctrl_chan.chan,
+                                    HID_PSM_CONTROL);
+    if (err) {
+        LOG_WRN("[BT] L2CAP fallback: Control connect failed (%d), "
+                "falling back to disconnect+retry\n", err);
+        hid_ctx.fallback_retry = true;
+        bt_hid_host_disconnect();
+    }
     return true;
 }
 
@@ -1773,6 +1886,7 @@ void bt_hid_host_force_disconnect(void)
     hid_ctx.handshake_next  = 0;
     hid_ctx.handshake_count = 0;
     hid_ctx.handshake_send_failed = false;
+    hid_ctx.handshake_sent_us = 0;
     hid_ctx.connect_pending = false;
     hid_ctx.sdp_pending = false;
     hid_ctx.security_pending = false;
@@ -1780,6 +1894,11 @@ void bt_hid_host_force_disconnect(void)
 
     first_intr_logged  = false;
     first_output_logged = false;
+    l2_diag_last_us = 0;
+    l2_diag_cnt = 0;
+    l2_slow_last_log_us = 0;
+    l2_slow_since_log = 0;
+    page_scan_fallback_fired = false;
 
     app_tx_fifo_reset();
 
@@ -2072,11 +2191,12 @@ int bt_hid_host_switch_next(void)
         hid_ctx.security_done = false;
         hid_ctx.sdp_pending = false;
         hid_ctx.connect_pending = false;
-        hid_ctx.handshake_next  = 0;
-        hid_ctx.handshake_count = 0;
-        hid_ctx.handshake_send_failed = false;
+    hid_ctx.handshake_next  = 0;
+    hid_ctx.handshake_count = 0;
+    hid_ctx.handshake_send_failed = false;
+    hid_ctx.handshake_sent_us = 0;
 
-        app_tx_fifo_reset();
+    app_tx_fifo_reset();
         feature_cache_clear();
         dse_reset();
         cached_rssi = 1;
@@ -2135,6 +2255,7 @@ void bt_hid_host_clear_bonds(void)
     hid_ctx.handshake_next  = 0;
     hid_ctx.handshake_count = 0;
     hid_ctx.handshake_send_failed = false;
+    hid_ctx.handshake_sent_us = 0;
     hid_ctx.security_pending = false;
     hid_ctx.security_done = false;
     hid_ctx.sdp_pending = false;
@@ -2160,6 +2281,12 @@ void bt_hid_host_clear_bonds(void)
     dse_reset();
 
     set_state(BT_HID_STATE_IDLE);
+}
+
+void bt_hid_host_clear_target(void)
+{
+    hid_ctx.has_target = false;
+    memset(&hid_ctx.target_addr, 0, sizeof(hid_ctx.target_addr));
 }
 
 bool bt_hid_host_get_cached_feature(uint8_t report_id,
@@ -2236,8 +2363,27 @@ void bt_hid_host_persist_if_dirty(void)
 
 void bt_hid_host_handshake_tick(void)
 {
-    if (hid_ctx.state == BT_HID_STATE_HANDSHAKE &&
-        hid_ctx.handshake_send_failed) {
+    if (hid_ctx.state != BT_HID_STATE_HANDSHAKE)
+        return;
+
+    if (hid_ctx.handshake_send_failed) {
+        handshake_send_next();
+        return;
+    }
+
+    /* Per-report timeout for the DSE probe (0x70) only.
+     * Some third-party controllers silently ignore unknown report IDs
+     * instead of replying HANDSHAKE_INVALID_ID. We only timeout on 0x70
+     * to avoid skipping essential reports (calibration, pairing, etc.)
+     * on slow BT links. */
+    if (hid_ctx.handshake_sent_us != 0 &&
+        hid_ctx.handshake_next > 0 &&
+        hid_ctx.handshake_ids[hid_ctx.handshake_next - 1] == 0x70 &&
+        (bflb_mtimer_get_time_us() - hid_ctx.handshake_sent_us) >
+        1500000ULL) {
+        LOG_WRN("[HID] GET_REPORT(0x70) no response in 1.5s, "
+               "assuming non-Edge\n");
+        hid_ctx.handshake_sent_us = 0;
         handshake_send_next();
     }
 }
@@ -2254,4 +2400,32 @@ void bt_hid_host_radio_wake(void)
     bt_br_set_connectable(true);
     bt_br_set_discoverable(true);
     LOG_INF("[BT] Radio wake — page/inquiry scan re-enabled\n");
+}
+
+void bt_hid_host_on_resume(void)
+{
+    l2_slow_last_log_us = 0;
+    l2_slow_since_log = 0;
+    page_scan_fallback_fired = false;
+
+    /* radio_wake() just re-enabled page scan (100% duty cycle:
+     * interval=window=11.25ms). With an active ACL link this starves
+     * L2CAP data to ~14ms gaps. Restore connectable=false to match
+     * what l2cap_intr_connected() does on a fresh connection. */
+    if (hid_ctx.conn && hid_ctx.intr_connected) {
+        int c = bt_br_set_connectable(false);
+        int d = bt_br_set_discoverable(false);
+        if (c != 0 || d != 0) {
+            int raw = hci_raw_write_scan_enable(0x00);
+            LOG_INF("[BT] on_resume: scan OFF api c=%d d=%d, raw=%d\n",
+                   c, d, raw);
+        } else {
+            LOG_INF("[BT] on_resume: page scan OFF\n");
+        }
+    }
+}
+
+void bt_hid_host_ensure_connectable(void)
+{
+    bt_br_set_connectable(true);
 }
