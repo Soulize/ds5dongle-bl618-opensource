@@ -462,11 +462,9 @@ int audio_init(void)
     }
 
     opus_encoder_ctl(encoder, OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
-    opus_encoder_ctl(encoder, OPUS_SET_BITRATE(128000));
+    opus_encoder_ctl(encoder, OPUS_SET_BITRATE(160000));
     opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
     opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
-    opus_encoder_ctl(encoder, OPUS_SET_PREDICTION_DISABLED(1));
-    opus_encoder_ctl(encoder, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_SUPERWIDEBAND));
     encoder_channels = 1;
 
     decoder = (OpusDecoder *)decoder_mem;
@@ -576,11 +574,9 @@ void audio_task(void *arg)
                         OPUS_APPLICATION_RESTRICTED_CELT);
                     if (reinit_err == OPUS_OK) {
                         opus_encoder_ctl(encoder, OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
-                        opus_encoder_ctl(encoder, OPUS_SET_BITRATE(128000));
+                        opus_encoder_ctl(encoder, OPUS_SET_BITRATE(160000));
                         opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
                         opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
-                        opus_encoder_ctl(encoder, OPUS_SET_PREDICTION_DISABLED(1));
-                        opus_encoder_ctl(encoder, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_SUPERWIDEBAND));
                         encoder_channels = target_channels;
                         LOG_INF("[AUDIO] Encoder reinit %dch\n", target_channels);
                     } else {
