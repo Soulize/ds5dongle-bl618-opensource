@@ -463,7 +463,7 @@ int audio_init(void)
 
     opus_encoder_ctl(encoder, OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
     opus_encoder_ctl(encoder, OPUS_SET_BITRATE(160000));
-    opus_encoder_ctl(encoder, OPUS_SET_VBR(0));
+    opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
     opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
     opus_encoder_ctl(encoder, OPUS_SET_FORCE_CHANNELS(1));
     encoder_channels = 2;
@@ -576,7 +576,7 @@ void audio_task(void *arg)
                     if (reinit_err == OPUS_OK) {
                         opus_encoder_ctl(encoder, OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
                         opus_encoder_ctl(encoder, OPUS_SET_BITRATE(160000));
-                        opus_encoder_ctl(encoder, OPUS_SET_VBR(0));
+                        opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
                         opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
                         opus_encoder_ctl(encoder, OPUS_SET_FORCE_CHANNELS(1));
                         encoder_channels = target_channels;
