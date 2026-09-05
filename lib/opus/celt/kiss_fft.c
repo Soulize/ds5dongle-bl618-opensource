@@ -562,6 +562,7 @@ static void fft_downshift(kiss_fft_cpx *x, int N, int *total, int step) {
 #ifdef OPUS_TCM_CODE
 OPUS_TCM_CODE
 #endif
+__attribute__((hot))
 void opus_fft_impl(const kiss_fft_state *st,kiss_fft_cpx *fout ARG_FIXED(int downshift))
 {
     int m2, m;

@@ -1191,6 +1191,7 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
     int prefill=0;
     int redundancy = 0;
     int celt_to_silk = 0;
+    OPUS_PROF(8);
     int to_celt = 0;
     int voice_est; /* Probability of voice in Q7 */
     opus_int32 equiv_rate;
@@ -1243,7 +1244,10 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
 
     if (st->application != OPUS_APPLICATION_RESTRICTED_SILK)
         celt_encoder_ctl(celt_enc, CELT_GET_MODE(&celt_mode));
-    is_silence = is_digital_silence(pcm, frame_size, st->channels, lsb_depth);
+    if (st->application == OPUS_APPLICATION_RESTRICTED_CELT)
+       is_silence = 0;
+    else
+       is_silence = is_digital_silence(pcm, frame_size, st->channels, lsb_depth);
 #ifndef DISABLE_FLOAT_API
     analysis_info.valid = 0;
 #ifdef FIXED_POINT
@@ -1307,15 +1311,18 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
     st->voice_ratio = -1;
 #endif
 
-    /* Track the peak signal energy */
-#ifndef DISABLE_FLOAT_API
-    if (!analysis_info.valid || analysis_info.activity_probability > DTX_ACTIVITY_THRESHOLD)
-#endif
+    /* Track the peak signal energy — only needed for DTX activity detection */
+    if (st->application != OPUS_APPLICATION_RESTRICTED_CELT)
     {
-       if (!is_silence)
+#ifndef DISABLE_FLOAT_API
+       if (!analysis_info.valid || analysis_info.activity_probability > DTX_ACTIVITY_THRESHOLD)
+#endif
        {
-          st->peak_signal_energy = MAX32(MULT16_32_Q15(QCONST16(0.999f, 15), st->peak_signal_energy),
-                compute_frame_energy(pcm, frame_size, st->channels, st->arch));
+          if (!is_silence)
+          {
+             st->peak_signal_energy = MAX32(MULT16_32_Q15(QCONST16(0.999f, 15), st->peak_signal_energy),
+                   compute_frame_energy(pcm, frame_size, st->channels, st->arch));
+          }
        }
     }
     if (st->channels==2 && st->force_channels!=1)
@@ -1890,6 +1897,7 @@ static opus_int32 opus_encode_frame_native(OpusEncoder *st, const opus_res *pcm,
     VARDECL(opus_res, tmp_prefill);
     SAVE_STACK;
 
+    OPUS_PROF(9);
     max_data_bytes = IMIN(orig_max_data_bytes, 1276);
     st->rangeFinal = 0;
     if (st->application != OPUS_APPLICATION_RESTRICTED_CELT)
@@ -1923,9 +1931,12 @@ static opus_int32 opus_encode_frame_native(OpusEncoder *st, const opus_res *pcm,
        }
     }
 #endif
+    else if (st->application == OPUS_APPLICATION_RESTRICTED_CELT) {
+       /* RESTRICTED_CELT without DTX: skip compute_frame_energy entirely */
+       activity = VAD_NO_DECISION;
+    }
     else if (st->mode == MODE_CELT_ONLY) {
        opus_val32 noise_energy = compute_frame_energy(pcm, frame_size, st->channels, st->arch);
-       /* Boosting peak energy a bit because we didn't just average the active frames. */
        activity = st->peak_signal_energy < (QCONST16(PSEUDO_SNR_THRESHOLD, 0) * (opus_val64)HALF32(noise_energy));
     }
 
@@ -2005,7 +2016,9 @@ static opus_int32 opus_encode_frame_native(OpusEncoder *st, const opus_res *pcm,
        if (st->enable_qext) OPUS_COPY(&pcm_buf[total_buffer*st->channels], pcm, frame_size*st->channels);
        else
 #endif
+       OPUS_PROF(10);
        dc_reject(pcm, 3, &pcm_buf[total_buffer*st->channels], st->hp_mem, frame_size, st->channels, st->Fs);
+       OPUS_PROF(11);
     }
 #ifndef FIXED_POINT
     if (float_api)
@@ -2490,7 +2503,9 @@ static opus_int32 opus_encode_frame_native(OpusEncoder *st, const opus_res *pcm,
 #ifdef ENABLE_QEXT
            if (st->mode == MODE_CELT_ONLY) celt_encoder_ctl(celt_enc, OPUS_SET_QEXT(st->enable_qext));
 #endif
+           OPUS_PROF(12);
            ret = celt_encode_with_ec(celt_enc, pcm_buf, frame_size, NULL, nb_compr_bytes, &enc);
+           OPUS_PROF(13);
 #ifdef ENABLE_QEXT
            celt_encoder_ctl(celt_enc, OPUS_SET_QEXT(0));
 #endif

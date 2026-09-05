@@ -1,0 +1,9 @@
+# Local Branch 规则
+
+分支 `local/sync-v3.19` 是本地工作分支，**禁止推送到远程**。
+
+- 不得执行 `git push` 将此分支推送到 origin
+- 同步完成并验证后，由用户决定如何合入 master
+
+- 本地构建fs和hs两个固件之后，按远程release样式，打包两个固件，包括readme和更新日志等内容，更新日志使用web项目的最新更新日志页面的内容。最后将zip包copy到ds5dongle-618仓库的dev分支的firmware目录下opensouce目录，然后从618仓库提交zip
+- 用户最后决定zip是否发布远程release

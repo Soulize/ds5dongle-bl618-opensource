@@ -128,10 +128,126 @@ static OPUS_INLINE void xcorr_kernel_c(const opus_val16 * x, const opus_val16 * 
    }
 }
 
+#if defined(E907_OPUS_DSP) && defined(FIXED_POINT)
+/*
+ * E907 P-extension optimized pitch correlation functions.
+ *
+ * Key instruction: kmda rd, rs1, rs2
+ *   rd = rs1[15:0]*rs2[15:0] + rs1[31:16]*rs2[31:16]
+ *   Two 16x16 MACs in a single instruction.
+ *
+ * By loading two consecutive int16 values as one 32-bit word (little-endian),
+ * we process 2 elements per kmda, halving the loop iterations.
+ *
+ * pkbt16 rd, rs1, rs2 constructs shifted packed values:
+ *   rd = {rs1[15:0], rs2[31:16]}
+ * Used in xcorr_kernel to build odd-aligned y[] pairs.
+ */
+
+static OPUS_INLINE opus_val32 celt_inner_prod_e907(const opus_val16 *x,
+      const opus_val16 *y, int N)
+{
+   int i;
+   opus_val32 xy = 0;
+   for (i = 0; i + 3 < N; i += 4) {
+      opus_val32 p0, p1;
+      __asm__ volatile("kmda %0, %1, %2" : "=r"(p0)
+          : "r"(*(const opus_val32*)(x+i)), "r"(*(const opus_val32*)(y+i)));
+      __asm__ volatile("kmda %0, %1, %2" : "=r"(p1)
+          : "r"(*(const opus_val32*)(x+i+2)), "r"(*(const opus_val32*)(y+i+2)));
+      xy += p0 + p1;
+   }
+   for (; i < N; i++)
+      xy = MAC16_16(xy, x[i], y[i]);
+   return xy;
+}
+
+static OPUS_INLINE void dual_inner_prod_e907(const opus_val16 *x,
+      const opus_val16 *y01, const opus_val16 *y02,
+      int N, opus_val32 *xy1, opus_val32 *xy2)
+{
+   int i;
+   opus_val32 s1 = 0, s2 = 0;
+   for (i = 0; i + 3 < N; i += 4) {
+      opus_val32 px0 = *(const opus_val32*)(x+i);
+      opus_val32 px1 = *(const opus_val32*)(x+i+2);
+      opus_val32 p0, p1, p2, p3;
+      __asm__ volatile("kmda %0, %1, %2" : "=r"(p0)
+          : "r"(px0), "r"(*(const opus_val32*)(y01+i)));
+      __asm__ volatile("kmda %0, %1, %2" : "=r"(p1)
+          : "r"(px1), "r"(*(const opus_val32*)(y01+i+2)));
+      __asm__ volatile("kmda %0, %1, %2" : "=r"(p2)
+          : "r"(px0), "r"(*(const opus_val32*)(y02+i)));
+      __asm__ volatile("kmda %0, %1, %2" : "=r"(p3)
+          : "r"(px1), "r"(*(const opus_val32*)(y02+i+2)));
+      s1 += p0 + p1;
+      s2 += p2 + p3;
+   }
+   for (; i < N; i++) {
+      s1 = MAC16_16(s1, x[i], y01[i]);
+      s2 = MAC16_16(s2, x[i], y02[i]);
+   }
+   *xy1 = s1;
+   *xy2 = s2;
+}
+
+static OPUS_INLINE void xcorr_kernel_e907(const opus_val16 *x,
+      const opus_val16 *y, opus_val32 sum[4], int len)
+{
+   int j;
+   /* Process 2 x-elements per iteration.
+    * sum[k] = Σ x[j]*y[j+k], k=0..3
+    * For each pair (x[j], x[j+1]), we need y words at offsets 0,1,2,3,4.
+    * Word loads give even-aligned pairs; pkbt16 constructs odd-aligned pairs. */
+   for (j = 0; j + 1 < len; j += 2) {
+      opus_val32 px  = *(const opus_val32*)(x + j);
+      opus_val32 wy0 = *(const opus_val32*)(y + j);
+      opus_val32 wy1 = *(const opus_val32*)(y + j + 2);
+      opus_val32 ry1, ry3, p;
+      /* {y[j+2], y[j+1]}: B(wy1)=y[j+2] → top, T(wy0)=y[j+1] → bottom */
+      __asm__ volatile("pkbt16 %0, %1, %2" : "=r"(ry1) : "r"(wy1), "r"(wy0));
+      /* {y[j+4], y[j+3]}: only load y[j+4], reuse T(wy1)=y[j+3] */
+      __asm__ volatile("pkbt16 %0, %1, %2" : "=r"(ry3)
+          : "r"((opus_val32)y[j+4]), "r"(wy1));
+
+      __asm__ volatile("kmda %0, %1, %2" : "=r"(p) : "r"(px), "r"(wy0));
+      sum[0] += p;
+      __asm__ volatile("kmda %0, %1, %2" : "=r"(p) : "r"(px), "r"(ry1));
+      sum[1] += p;
+      __asm__ volatile("kmda %0, %1, %2" : "=r"(p) : "r"(px), "r"(wy1));
+      sum[2] += p;
+      __asm__ volatile("kmda %0, %1, %2" : "=r"(p) : "r"(px), "r"(ry3));
+      sum[3] += p;
+   }
+   if (j < len) {
+      opus_val16 tmp = x[j];
+      sum[0] = MAC16_16(sum[0], tmp, y[j]);
+      sum[1] = MAC16_16(sum[1], tmp, y[j+1]);
+      sum[2] = MAC16_16(sum[2], tmp, y[j+2]);
+      sum[3] = MAC16_16(sum[3], tmp, y[j+3]);
+   }
+}
+
+#define OVERRIDE_XCORR_KERNEL
+#define xcorr_kernel(x, y, sum, len, arch) \
+    ((void)(arch),xcorr_kernel_e907(x, y, sum, len))
+
+#define OVERRIDE_DUAL_INNER_PROD
+#define dual_inner_prod(x, y01, y02, N, xy1, xy2, arch) \
+    ((void)(arch),dual_inner_prod_e907(x, y01, y02, N, xy1, xy2))
+
+#define OVERRIDE_CELT_INNER_PROD
+#define celt_inner_prod(x, y, N, arch) \
+    ((void)(arch),celt_inner_prod_e907(x, y, N))
+
+#else /* !E907_OPUS_DSP || !FIXED_POINT */
+
 #ifndef OVERRIDE_XCORR_KERNEL
 #define xcorr_kernel(x, y, sum, len, arch) \
     ((void)(arch),xcorr_kernel_c(x, y, sum, len))
 #endif /* OVERRIDE_XCORR_KERNEL */
+
+#endif /* E907_OPUS_DSP && FIXED_POINT */
 
 
 static OPUS_INLINE void dual_inner_prod_c(const opus_val16 *x, const opus_val16 *y01, const opus_val16 *y02,

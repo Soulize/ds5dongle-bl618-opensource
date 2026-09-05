@@ -257,6 +257,7 @@ static unsigned extract_collapse_mask(int *iy, int N, int B)
    return collapse_mask;
 }
 
+__attribute__((hot))
 opus_val16 op_pvq_search_c(celt_norm *X, int *iy, int K, int N, int arch)
 {
    VARDECL(celt_norm, y);
@@ -382,28 +383,41 @@ opus_val16 op_pvq_search_c(celt_norm *X, int *iy, int K, int N, int arch)
       best_den = Ryy;
       best_num = Rxy;
       j=1;
-      do {
-         /* Temporary sums of the new pulse(s) */
-         Rxy = EXTRACT16(SHR32(ADD32(xy, EXTEND32(X[j])),rshift));
-         /* We're multiplying y[j] by two so we don't have to do it here */
-         Ryy = ADD16(yy, y[j]);
-
-         /* Approximate score: we maximise Rxy/sqrt(Ryy) (we're guaranteed that
-            Rxy is positive because the sign is pre-computed) */
-         Rxy = MULT16_16_Q15(Rxy,Rxy);
-         /* The idea is to check for num/den >= best_num/best_den, but that way
-            we can do it without any division */
-         /* OPT: It's not clear whether a cmov is faster than a branch here
-            since the condition is more often false than true and using
-            a cmov introduces data dependencies across iterations. The optimal
-            choice may be architecture-dependent. */
-         if (opus_unlikely(MULT16_16(best_den, Rxy) > MULT16_16(Ryy, best_num)))
-         {
-            best_den = Ryy;
-            best_num = Rxy;
-            best_id = j;
+      {
+         int jlim = 1 + ((N - 1) & ~1);
+         for (; j < jlim; j += 2) {
+            opus_val16 Rxy0, Rxy1, Ryy0, Ryy1;
+            Rxy0 = EXTRACT16(SHR32(ADD32(xy, EXTEND32(X[j])),rshift));
+            Ryy0 = ADD16(yy, y[j]);
+            Rxy0 = MULT16_16_Q15(Rxy0,Rxy0);
+            Rxy1 = EXTRACT16(SHR32(ADD32(xy, EXTEND32(X[j+1])),rshift));
+            Ryy1 = ADD16(yy, y[j+1]);
+            Rxy1 = MULT16_16_Q15(Rxy1,Rxy1);
+            if (opus_unlikely(MULT16_16(best_den, Rxy0) > MULT16_16(Ryy0, best_num)))
+            {
+               best_den = Ryy0;
+               best_num = Rxy0;
+               best_id = j;
+            }
+            if (opus_unlikely(MULT16_16(best_den, Rxy1) > MULT16_16(Ryy1, best_num)))
+            {
+               best_den = Ryy1;
+               best_num = Rxy1;
+               best_id = j+1;
+            }
          }
-      } while (++j<N);
+         if (j < N) {
+            Rxy = EXTRACT16(SHR32(ADD32(xy, EXTEND32(X[j])),rshift));
+            Ryy = ADD16(yy, y[j]);
+            Rxy = MULT16_16_Q15(Rxy,Rxy);
+            if (opus_unlikely(MULT16_16(best_den, Rxy) > MULT16_16(Ryy, best_num)))
+            {
+               best_den = Ryy;
+               best_num = Rxy;
+               best_id = j;
+            }
+         }
+      }
 
       /* Updating the sums of the new pulse(s) */
       xy = ADD32(xy, EXTEND32(X[best_id]));

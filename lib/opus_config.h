@@ -24,6 +24,25 @@
 #define OPUS_TCM_CONST
 #endif
 
+/* Intra-encode profiling: only active at LOG_LEVEL >= 3 (debug builds). */
+#ifndef LOG_LEVEL
+#define LOG_LEVEL 2
+#endif
+#if LOG_LEVEL >= 3
+#define OPUS_ENCODE_PROFILING 1
+#endif
+#ifdef OPUS_ENCODE_PROFILING
+extern volatile unsigned int opus_prof_ts[16];
+static inline unsigned int _opus_prof_rd(void) {
+    unsigned int v;
+    __asm__ volatile("csrr %0, mcycle" : "=r"(v));
+    return v;
+}
+#define OPUS_PROF(idx) (opus_prof_ts[idx] = _opus_prof_rd())
+#else
+#define OPUS_PROF(idx)
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 

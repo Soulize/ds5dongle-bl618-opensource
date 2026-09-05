@@ -612,7 +612,28 @@ static OPUS_INLINE opus_int64 silk_max_64(opus_int64 a, opus_int64 b)
     ((void)(arch), silk_burg_modified_c(res_nrg, res_nrg_Q, A_Q16, x, minInvGain_Q30, subfr_length, nb_subfr, D, arch))
 #endif
 
-#if !defined(OVERRIDE_silk_inner_prod16)
+#if defined(E907_OPUS_DSP) && !defined(OVERRIDE_silk_inner_prod16)
+static OPUS_INLINE opus_int64 silk_inner_prod16_e907(
+    const opus_int16 *inVec1, const opus_int16 *inVec2, const opus_int len)
+{
+    opus_int64 sum = 0;
+    opus_int i = 0;
+    for (; i <= len - 2; i += 2) {
+        opus_int32 p;
+        __asm__ volatile("kmda %0, %1, %2"
+                         : "=r"(p)
+                         : "r"(*(const opus_int32 *)&inVec1[i]),
+                           "r"(*(const opus_int32 *)&inVec2[i]));
+        sum += p;
+    }
+    if (i < len)
+        sum += (opus_int64)inVec1[i] * inVec2[i];
+    return sum;
+}
+#define OVERRIDE_silk_inner_prod16
+#define silk_inner_prod16(inVec1, inVec2, len, arch) \
+    ((void)(arch), silk_inner_prod16_e907(inVec1, inVec2, len))
+#elif !defined(OVERRIDE_silk_inner_prod16)
 #define silk_inner_prod16(inVec1, inVec2, len, arch) \
     ((void)(arch),silk_inner_prod16_c(inVec1, inVec2, len))
 #endif
@@ -637,5 +658,8 @@ static OPUS_INLINE opus_int64 silk_max_64(opus_int64 a, opus_int64 b)
 #include "xtensa/SigProc_FIX_lx7.h"
 #endif
 
+#if defined(E907_OPUS_DSP)
+#include "e907/SigProc_FIX_e907.h"
+#endif
 
 #endif /* SILK_SIGPROC_FIX_H */

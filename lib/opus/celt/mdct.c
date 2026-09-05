@@ -122,6 +122,7 @@ void clt_mdct_clear(mdct_lookup *l, int arch)
 #ifdef OPUS_TCM_CODE
 OPUS_TCM_CODE
 #endif
+__attribute__((hot))
 void clt_mdct_forward_c(const mdct_lookup *l, kiss_fft_scalar *in, kiss_fft_scalar * OPUS_RESTRICT out,
       const celt_coef *window, int overlap, int shift, int stride, int arch)
 {
@@ -233,6 +234,7 @@ void clt_mdct_forward_c(const mdct_lookup *l, kiss_fft_scalar *in, kiss_fft_scal
    }
 
    /* N/4 complex FFT, does not downscale anymore */
+   OPUS_PROF(7);
    opus_fft_impl(st, f2 ARG_FIXED(scale_shift-headroom));
 
    /* Post-rotate */

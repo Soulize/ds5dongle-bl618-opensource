@@ -1594,6 +1594,7 @@ static void special_hybrid_folding(const CELTMode *m, celt_norm *norm, celt_norm
 #ifdef OPUS_TCM_CODE
 OPUS_TCM_CODE
 #endif
+__attribute__((hot))
 void quant_all_bands(int encode, const CELTMode *m, int start, int end,
       celt_norm *X_, celt_norm *Y_, unsigned char *collapse_masks,
       const celt_ener *bandE, int *pulses, int shortBlocks, int spread,

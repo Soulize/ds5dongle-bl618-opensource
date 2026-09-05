@@ -42,7 +42,7 @@ target_compile_options(libopuscodec PRIVATE
     -include${CMAKE_CURRENT_LIST_DIR}/lib/opus_config.h
 )
 set_source_files_properties(${OPUS_SOURCES} PROPERTIES
-    COMPILE_OPTIONS "-O3;-fbuiltin;-fno-lto;-fjump-tables"
+    COMPILE_OPTIONS "-O3;-fbuiltin;-fno-lto;-fjump-tables;-fomit-frame-pointer;-falign-functions=32;-falign-loops=8"
 )
 set_source_files_properties(src/audio.c PROPERTIES
     COMPILE_OPTIONS "-O3"
@@ -90,24 +90,43 @@ set(OPUS_RAM_LINKER_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/generated/opus_all_ram.l
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(WRITE "${OPUS_RAM_LINKER_SCRIPT}" "${OPUS_LINKER_CONTENT}")
 sdk_set_linker_script_macro("${OPUS_RAM_LINKER_SCRIPT}")
+# Read version.conf and re-configure automatically when it changes
+set(VERSION_CONF "${CMAKE_CURRENT_LIST_DIR}/version.conf")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${VERSION_CONF}")
+file(STRINGS "${VERSION_CONF}" _version_lines REGEX "^[A-Z_]+=.+$")
+foreach(_line ${_version_lines})
+    string(REGEX MATCH "^([A-Z_]+)=(.+)$" _match "${_line}")
+    set(${CMAKE_MATCH_1} "${CMAKE_MATCH_2}")
+endforeach()
+
 # Board selection via env vars (mutually exclusive)
 if(DEFINED ENV{BOARD_LCTECH_616})
     target_compile_definitions(app PRIVATE BOARD_LCTECH_616=1)
+    set(_FW_PREFIX "LCT616-DS5")
+    set(_FW_VER "${LCTECH_VERSION}")
     message(STATUS "Target board: LCTech BL616")
 elseif(DEFINED ENV{BOARD_M0S_DOCK})
     target_compile_definitions(app PRIVATE BOARD_M0S_DOCK=1)
+    set(_FW_PREFIX "M0S-DS5")
+    set(_FW_VER "${M0S_VERSION}")
     message(STATUS "Target board: Sipeed M0S Dock (BL616)")
 else()
+    set(_FW_PREFIX "AIM61-DS5")
+    set(_FW_VER "${AIM61_VERSION}")
     message(STATUS "Target board: Ai-M61-32S-Kit (BL618)")
 endif()
 
 target_compile_definitions(app PRIVATE HAVE_CONFIG_H)
 if(DEFINED ENV{FORCE_FS})
     target_compile_definitions(app PRIVATE FORCE_FS_MODE=1)
+    set(_FW_VERSION_STR "${_FW_PREFIX} ${_FW_VER}")
     message(STATUS "USB mode: Full-Speed (compatibility variant)")
 else()
+    set(_FW_VERSION_STR "${_FW_PREFIX} ${_FW_VER}H")
     message(STATUS "USB mode: High-Speed (default)")
 endif()
+target_compile_definitions(app PRIVATE FIRMWARE_VERSION_STR="${_FW_VERSION_STR}")
+message(STATUS "Firmware version: ${_FW_VERSION_STR}")
 target_compile_options(app PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-include${CMAKE_CURRENT_LIST_DIR}/lib/opus_config.h>
 )

@@ -1422,12 +1422,25 @@ static int run_prefilter(CELTEncoder *st, celt_sig *in, celt_sig *prefilter_mem,
    int min_period, max_period;
    opus_val32 before[2]={0}, after[2]={0};
    int cancel_pitch=0;
+
+   mode = st->mode;
+   overlap = mode->overlap;
+
+   if (!enabled) {
+      c=0; do {
+         OPUS_COPY(in+c*(N+overlap), st->in_mem+c*(overlap), overlap);
+         OPUS_COPY(st->in_mem+c*(overlap), in+c*(N+overlap)+N, overlap);
+      } while (++c<CC);
+      *pitch = COMBFILTER_MINPERIOD;
+      *gain = 0;
+      *qgain = 0;
+      return 0;
+   }
+
    SAVE_STACK;
 
    max_period = QEXT_SCALE(COMBFILTER_MAXPERIOD);
    min_period = QEXT_SCALE(COMBFILTER_MINPERIOD);
-   mode = st->mode;
-   overlap = mode->overlap;
    ALLOC(_pre, CC*(N+max_period), celt_sig);
 
    pre[0] = _pre;
@@ -2009,6 +2022,7 @@ int celt_encode_with_ec(CELTEncoder * OPUS_RESTRICT st, const opus_res * pcm, in
       tell = nbCompressedBytes*8;
       enc->nbits_total+=tell-ec_tell(enc);
    }
+   OPUS_PROF(0);
    c=0; do {
       int need_clip=0;
 #ifdef FIXED_POINT
@@ -2021,8 +2035,9 @@ int celt_encode_with_ec(CELTEncoder * OPUS_RESTRICT st, const opus_res * pcm, in
       OPUS_COPY(in+c*(N+overlap), &prefilter_mem[(1+c)*QEXT_SCALE(COMBFILTER_MAXPERIOD)-overlap], overlap);
    } while (++c<CC);
 
-
-   tone_freq = tone_detect(in, CC, N+overlap, &toneishness, mode->Fs);
+   OPUS_PROF(4);
+   if (st->complexity >= 1)
+      tone_freq = tone_detect(in, CC, N+overlap, &toneishness, mode->Fs);
    isTransient = 0;
    shortBlocks = 0;
    if (st->complexity >= 1 && !st->lfe)
@@ -2091,13 +2106,16 @@ int celt_encode_with_ec(CELTEncoder * OPUS_RESTRICT st, const opus_res * pcm, in
       }
    }
 
+   OPUS_PROF(5);
    compute_mdcts(mode, shortBlocks, in, freq, C, CC, LM, st->upsample, st->arch);
+   OPUS_PROF(6);
    /* This should catch any NaN in the CELT input. Since we're not supposed to see any (they're filtered
       at the Opus layer), just abort. */
    celt_assert(!celt_isnan(freq[0]) && (C==1 || !celt_isnan(freq[N])));
    if (CC==2&&C==1)
       tf_chan = 0;
    compute_band_energies(mode, freq, bandE, effEnd, C, LM, st->arch);
+   OPUS_PROF(1);
 
    if (st->lfe)
    {
@@ -2672,12 +2690,14 @@ int celt_encode_with_ec(CELTEncoder * OPUS_RESTRICT st, const opus_res * pcm, in
 
    /* Residual quantisation */
    ALLOC(collapse_masks, C*nbEBands, unsigned char);
+   OPUS_PROF(2);
    quant_all_bands(1, mode, start, end, X, C==2 ? X+N : NULL, collapse_masks,
          bandE, pulses, shortBlocks, st->spread_decision,
          dual_stereo, st->intensity, tf_res, nbCompressedBytes*(8<<BITRES)-anti_collapse_rsv,
          balance, enc, LM, codedBands, &st->rng, st->complexity, st->arch, st->disable_inv
          ARG_QEXT(&ext_enc) ARG_QEXT(extra_pulses)
          ARG_QEXT(qext_bytes*(8<<BITRES)) ARG_QEXT(cap));
+   OPUS_PROF(3);
 
 #ifdef ENABLE_QEXT
    if (qext_mode) {
