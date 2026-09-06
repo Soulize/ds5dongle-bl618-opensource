@@ -57,6 +57,8 @@ static volatile bool plug_headset;
 static volatile bool mic_enabled;   /* host opened mic interface AND config allows */
 static volatile bool mic_status_pending;  /* deferred: send 0x32 to controller */
 static int encoder_channels;
+static bool encoder_cpu_save;  /* true = CPU-save params active (headset+mic) */
+static bool encoder_params_dirty; /* force re-apply after reinit */
 
 /* Profiling timestamps written by celt_encode_with_ec (mcycle CSR) */
 volatile unsigned int opus_prof_ts[16];
@@ -467,6 +469,8 @@ int audio_init(void)
     opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
     /* 1ch (no headset): full quality — prediction enabled, full bandwidth */
     encoder_channels = 1;
+    encoder_cpu_save = false;
+    encoder_params_dirty = true; /* force apply on first frame */
 
     decoder = (OpusDecoder *)decoder_mem;
     err = opus_decoder_init(decoder, 48000, MIC_CHANNELS);
@@ -574,23 +578,36 @@ void audio_task(void *arg)
                         encoder, 48000, target_channels,
                         OPUS_APPLICATION_RESTRICTED_CELT);
                     if (reinit_err == OPUS_OK) {
-                        opus_encoder_ctl(encoder, OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
-                        opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
-                        opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
-                        if (target_channels == 2) {
-                            /* Headset: save CPU for mic task */
-                            opus_encoder_ctl(encoder, OPUS_SET_BITRATE(128000));
-                            opus_encoder_ctl(encoder, OPUS_SET_PREDICTION_DISABLED(1));
-                            opus_encoder_ctl(encoder, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_SUPERWIDEBAND));
-                        } else {
-                            /* No headset: full quality */
-                            opus_encoder_ctl(encoder, OPUS_SET_BITRATE(160000));
-                        }
                         encoder_channels = target_channels;
+                        encoder_params_dirty = true; /* force re-apply below */
                         LOG_INF("[AUDIO] Encoder reinit %dch\n", target_channels);
                     } else {
                         LOG_ERR("[AUDIO] Encoder reinit %dch failed: %d\n",
                                 target_channels, reinit_err);
+                    }
+                }
+
+                /* Dynamic encoder tuning:
+                 * - Headset + mic active → CPU-save (128k, pred off, SWB)
+                 * - Otherwise            → full quality (160k, pred on, full BW)
+                 * Only re-apply when state changes to avoid per-frame ctl overhead. */
+                bool need_cpu_save = (encoder_channels == 2 && mic_enabled);
+                if (need_cpu_save != encoder_cpu_save || encoder_params_dirty) {
+                    encoder_params_dirty = false;
+                    encoder_cpu_save = need_cpu_save;
+                    opus_encoder_ctl(encoder, OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
+                    opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
+                    opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
+                    if (encoder_cpu_save) {
+                        opus_encoder_ctl(encoder, OPUS_SET_BITRATE(128000));
+                        opus_encoder_ctl(encoder, OPUS_SET_PREDICTION_DISABLED(1));
+                        opus_encoder_ctl(encoder, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_SUPERWIDEBAND));
+                        LOG_INF("[AUDIO] Encoder → CPU-save (headset+mic)\n");
+                    } else {
+                        opus_encoder_ctl(encoder, OPUS_SET_BITRATE(160000));
+                        opus_encoder_ctl(encoder, OPUS_SET_PREDICTION_DISABLED(0));
+                        opus_encoder_ctl(encoder, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_FULLBAND));
+                        LOG_INF("[AUDIO] Encoder → full quality\n");
                     }
                 }
 
@@ -770,6 +787,8 @@ void audio_reset(void)
     mic_enabled = false;
     mic_status_pending = false;
     mic_first_frame = false;
+    encoder_cpu_save = false;
+    encoder_params_dirty = false;
     memset(opus_slots, 0, sizeof(opus_slots));
     memset(haptic_slots, 0, sizeof(haptic_slots));
     if (encoding_in_progress) {
