@@ -1262,7 +1262,7 @@ static void usb_task(void *arg)
     uint64_t opt_inject_us   = 0;
     uint64_t opt_press_start_us = 0;
     bool     opt_past_window    = false;
-    #define COMBO_WINDOW_US    (150ULL * 1000)
+    #define COMBO_WINDOW_US    (80ULL * 1000)
     #define RELEASE_INJECT_MS  30
     #define VOL_REPEAT_FIRST_MS  400
     #define VOL_REPEAT_NEXT_MS   120
