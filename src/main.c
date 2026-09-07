@@ -52,6 +52,7 @@
 #define L2CAP_FALLBACK_TIMEOUT_TICKS pdMS_TO_TICKS(3000)
 
 #define INPUT_QUEUE_ITEM_SZ  DS5_BT_INPUT_REPORT_SIZE
+#define INPUT_QUEUE_DEPTH    16  /* ~21 ms of BT reports at ~750 Hz */
 #define USB_OUTPUT_BUF_SZ    64  /* Report ID (1) + SetStateData (up to 63 for DSE) */
 
 static QueueHandle_t input_queue;
@@ -89,7 +90,8 @@ static bool first_input_logged = false;
 static uint32_t usb_fwd_count = 0;
 
 static volatile uint64_t out_isr_ts_us = 0;   /* timestamp set in USB ISR */
-static volatile uint32_t out_drop_count = 0;   /* queue-full drops */
+static volatile uint32_t out_drop_count = 0;   /* output queue-full drops */
+static volatile uint32_t input_drop_count = 0; /* ordered input FIFO overflow */
 
 /* Apply dongle config overlays directly onto a raw SetStateData frame
  * (pass-through mode — no flag accumulation, matches DS5Dongle behavior). */
@@ -400,9 +402,20 @@ static void on_hid_input(const uint8_t *data, uint16_t len)
             first_input_logged = true;
             LOG_INF("[MAIN] First input report received (%d bytes)\n", len);
         }
-        /* xQueueOverwrite copies synchronously; avoid a redundant
-         * stack buffer + memcpy in the BT -> USB hot path. */
-        xQueueOverwrite(input_queue, data);
+        if (config_input_report_mode() == INPUT_REPORT_MODE_ORDERED_FIFO) {
+            /* Compatibility/ordered mode: preserve every BT report in arrival
+             * order. If the bounded FIFO is ever full, drop the new report so
+             * already queued temporal order is never rewritten. */
+            if (xQueueSendToBack(input_queue, data, 0) != pdTRUE)
+                input_drop_count++;
+        } else {
+            /* Realtime mode: collapse any queued stale reports, then publish
+             * only the newest complete controller state. */
+            uint8_t stale[INPUT_QUEUE_ITEM_SZ];
+            while (xQueueReceive(input_queue, stale, 0) == pdTRUE) {}
+            if (xQueueSendToBack(input_queue, data, 0) != pdTRUE)
+                input_drop_count++;
+        }
     }
 }
 
@@ -1710,10 +1723,9 @@ int main(void)
     bool audio_ok = (audio_init() == 0);
     LOG_INF("[B] audio: %s\n", audio_ok ? "OK" : "FAIL");
 
-    input_queue = xQueueCreate(1, INPUT_QUEUE_ITEM_SZ);
-    /* Depth-1: USB ISR always delivers the latest report to usb_task.
-     * The 10-deep app_tx_fifo in bt_hid_host.c provides the actual buffering
-     * and CAN_SEND_NOW flow control (one BT packet in-flight at a time). */
+    input_queue = xQueueCreate(INPUT_QUEUE_DEPTH, INPUT_QUEUE_ITEM_SZ);
+    /* Realtime mode drains this queue to newest-state semantics in the BT
+     * callback. Ordered mode uses the same storage as a true FIFO. */
     output_queue = xQueueCreate(5, USB_OUTPUT_BUF_SZ);
     if (!input_queue || !output_queue) {
         LOG_ERR("[B] queue alloc FAIL\n");

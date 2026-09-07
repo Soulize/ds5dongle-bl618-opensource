@@ -94,10 +94,12 @@ static uint8_t  audio_batch_count;
 static bool     audio_batch_speaker;
 static bool     audio_batch_headset;
 static int      audio_batch_channels;
-/* BL616 is single-core: keep speaker one 10.67ms source frame behind haptics.
- * opus_slots[0] is the previous encoded frame (lag), opus_slots[1] is the
- * first frame of the current haptics batch. The second current speaker frame
- * is encoded only AFTER the current haptics packet has been submitted. */
+static uint8_t  audio_batch_latency_mode;
+/* Frame 0 must survive release of the zero-copy USB buffer in legacy-sync and
+ * max-haptics modes, where its Opus encode is deliberately deferred. */
+static __attribute__((aligned(32))) int16_t speaker_frame0_stage[ACCUM_SAMPLES * USB_AUDIO_CHANNELS];
+/* Lagged modes use cached valid Opus packets until a previous speaker frame
+ * exists for the current route/channel configuration. */
 static bool     speaker_pipeline_primed;
 
 static bool     silence_ready;
@@ -300,7 +302,9 @@ static void prime_speaker_pipeline(int channels)
 {
     const uint8_t *silence = (channels == 2)
                            ? opus_silence_stereo : opus_silence_mono;
+    /* Prime both positions: balanced-1f needs slot 0, max-2f needs both. */
     memcpy(opus_slots[0], silence, OPUS_OUT_SIZE);
+    memcpy(opus_slots[1], silence, OPUS_OUT_SIZE);
     speaker_pipeline_primed = true;
 }
 
@@ -711,31 +715,36 @@ void audio_task(void *arg)
                 }
 
                 uint8_t ah_mode = config_get()->audio_haptic;
-
+                uint8_t latency_mode = config_haptic_latency_mode();
 
 #if LOG_LEVEL >= 3
                 uint64_t prof_haptic = 0, prof_resamp = 0;
                 uint64_t prof_opus = 0;
 #endif
 
-                /* DS5_Bridge-style producer separation: process one 512-sample
-                   USB frame as soon as it is complete. The Bluetooth 0x39 format
-                   remains a two-frame compositor. */
+                /* Process one 512-sample USB frame at a time. The DualSense
+                 * 0x39 transport remains a two-frame compositor; only speaker
+                 * scheduling changes between the selectable policies. */
                 if (audio_batch_count != 0 &&
                     (audio_batch_speaker != speaker_on ||
                      audio_batch_headset != plug_headset ||
-                     audio_batch_channels != target_channels)) {
+                     audio_batch_channels != target_channels ||
+                     audio_batch_latency_mode != latency_mode)) {
                     audio_batch_count = 0;
                     speaker_pipeline_primed = false;
                 }
-                if (!speaker_on)
+
+                if (!speaker_on || latency_mode == HAPTIC_LATENCY_LEGACY_SYNC) {
                     speaker_pipeline_primed = false;
-                if (speaker_on && !speaker_pipeline_primed)
+                } else if (!speaker_pipeline_primed) {
                     prime_speaker_pipeline(target_channels);
+                }
+
                 if (audio_batch_count == 0) {
                     audio_batch_speaker = speaker_on;
                     audio_batch_headset = plug_headset;
                     audio_batch_channels = target_channels;
+                    audio_batch_latency_mode = latency_mode;
                 }
 
                 const int slot = audio_batch_count;
@@ -755,29 +764,46 @@ void audio_task(void *arg)
                 prof_haptic += bflb_mtimer_get_time_us() - t_hap0;
 #endif
 
-                /* BL616 single-core haptics-first scheduler.
-                 * Frame 0: encode speaker immediately during the 10.67ms slack.
-                 * Frame 1: DO NOT encode yet. The current haptics pair is now
-                 * complete, so submit it first with [previous speaker, frame0].
-                 * Frame 1 speaker is encoded after BT submission and becomes
-                 * the previous frame for the next batch. */
                 if (speaker_on && slot == 0) {
+                    if (latency_mode == HAPTIC_LATENCY_BALANCED_1F) {
+                        /* Current low-latency policy: encode frame 0 during the
+                         * first 10.67ms window. At send time speaker contains
+                         * [previous frame1, current frame0]. */
 #if LOG_LEVEL >= 3
-                    uint64_t t_op0 = bflb_mtimer_get_time_us();
+                        uint64_t t_op0 = bflb_mtimer_get_time_us();
 #endif
-                    encode_speaker_frame(slot_pcm, opus_slots[1]);
+                        encode_speaker_frame(slot_pcm, opus_slots[1]);
 #if LOG_LEVEL >= 3
-                    prof_opus += bflb_mtimer_get_time_us() - t_op0;
+                        prof_opus += bflb_mtimer_get_time_us() - t_op0;
 #endif
+                    } else {
+                        /* Legacy-sync and max-2f intentionally defer frame 0
+                         * encoding; retain PCM after zero-copy USB release. */
+                        memcpy(speaker_frame0_stage, slot_pcm,
+                               sizeof(speaker_frame0_stage));
+                    }
                 }
 
                 audio_batch_count++;
                 if (audio_batch_count < AUDIO_BATCH_FRAMES)
                     goto audio_frame_done;
 
-                /* Both haptic slots are ready. Do not insert the old fixed 1ms
-                 * mic delay; mic decode already runs in its own FreeRTOS task. */
                 audio_batch_count = 0;
+
+                if (speaker_on && latency_mode == HAPTIC_LATENCY_LEGACY_SYNC) {
+                    /* Original-style synchronized policy: both current speaker
+                     * frames are encoded only after the haptics pair is ready.
+                     * This keeps speaker/haptics aligned but puts both Opus
+                     * encodes on the haptics critical path. */
+#if LOG_LEVEL >= 3
+                    uint64_t t_op_legacy = bflb_mtimer_get_time_us();
+#endif
+                    encode_speaker_frame(speaker_frame0_stage, opus_slots[0]);
+                    encode_speaker_frame(slot_pcm, opus_slots[1]);
+#if LOG_LEVEL >= 3
+                    prof_opus += bflb_mtimer_get_time_us() - t_op_legacy;
+#endif
+                }
 
 #if LOG_LEVEL >= 3
                 uint64_t t_send0 = bflb_mtimer_get_time_us();
@@ -860,9 +886,19 @@ void audio_task(void *arg)
                 }
 #endif
                 if (speaker_on) {
-                    /* Current haptics are already in the Bluetooth stack. */
-                    encode_speaker_frame(slot_pcm, opus_slots[0]);
-                    speaker_pipeline_primed = true;
+                    if (latency_mode == HAPTIC_LATENCY_BALANCED_1F) {
+                        /* Current haptics are already submitted. Frame 1 is the
+                         * lag frame for the next 0x39 packet. */
+                        encode_speaker_frame(slot_pcm, opus_slots[0]);
+                        speaker_pipeline_primed = true;
+                    } else if (latency_mode == HAPTIC_LATENCY_MAX_2F) {
+                        /* Maximum haptics priority: neither current speaker
+                         * frame is allowed onto the haptics critical path.
+                         * Encode the just-sent batch afterward for next 0x39. */
+                        encode_speaker_frame(speaker_frame0_stage, opus_slots[0]);
+                        encode_speaker_frame(slot_pcm, opus_slots[1]);
+                        speaker_pipeline_primed = true;
+                    }
                 }
             audio_frame_done:
                 ;

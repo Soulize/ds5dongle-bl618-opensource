@@ -635,25 +635,63 @@ static void (*hook_configured)(void) = NULL;
 static USB_NOCACHE_RAM_SECTION uint8_t usb_in_buf[64];
 static USB_NOCACHE_RAM_SECTION uint8_t kbd_buf[USB_KBD_EP_MPS];
 
-static volatile uint8_t pending_payload[DS5_USB_INPUT_PAYLOAD_LEN];
-static volatile bool    pending_active = false;
+/* Realtime/latest mailbox plus an ordered FIFO. USB HS polls faster than
+ * the controller's BT input rate, so FIFO occupancy should normally stay 0/1;
+ * depth 16 only absorbs scheduler/host stalls without rewriting order. */
+#define USB_INPUT_FIFO_DEPTH 16
+static uint8_t pending_payload[DS5_USB_INPUT_PAYLOAD_LEN];
+static volatile bool pending_active = false;
+static uint8_t ordered_payload[USB_INPUT_FIFO_DEPTH][DS5_USB_INPUT_PAYLOAD_LEN];
+static volatile uint8_t ordered_head = 0;
+static volatile uint8_t ordered_tail = 0;
+static volatile uint8_t input_report_mode_cached = INPUT_REPORT_MODE_REALTIME_LATEST;
+static volatile uint32_t ordered_input_drop_count = 0;
+
+static inline void reset_input_tx_state(void)
+{
+    pending_active = false;
+    ordered_head = 0;
+    ordered_tail = 0;
+}
 
 ATTR_TCM_SECTION
 static void try_send_pending(void)
 {
-    if (!pending_active || !usb_configured || ep_in_busy)
-         return;
-    /* Consume exactly one fresh report. Do not continuously pre-arm
-     * the previous controller state after each IN completion. */
+    if (!usb_configured || ep_in_busy)
+        return;
+
+    bool ordered = (input_report_mode_cached == INPUT_REPORT_MODE_ORDERED_FIFO);
+    uint8_t fifo_head = ordered_head;
+    if (ordered) {
+        if (fifo_head == ordered_tail)
+            return;
+    } else if (!pending_active) {
+        return;
+    }
+
     ep_in_busy = true;
-    pending_active = false;
     usb_in_buf[0] = DS5_USB_REPORT_ID_INPUT;
-    memcpy(usb_in_buf + 1, (const void *)pending_payload,
-           DS5_USB_INPUT_PAYLOAD_LEN);
+
+    if (ordered) {
+        memcpy(usb_in_buf + 1, ordered_payload[fifo_head],
+               DS5_USB_INPUT_PAYLOAD_LEN);
+        /* Consume before arming the endpoint so a very fast completion IRQ
+         * cannot observe the same FIFO element twice. Roll back on failure. */
+        ordered_head = (uint8_t)((fifo_head + 1) % USB_INPUT_FIFO_DEPTH);
+    } else {
+        /* Consume exactly one fresh report. New BT states arriving while USB
+         * is busy overwrite the mailbox, preserving latest-state semantics. */
+        pending_active = false;
+        memcpy(usb_in_buf + 1, pending_payload, DS5_USB_INPUT_PAYLOAD_LEN);
+    }
+
     int ret = usbd_ep_start_write(0, USB_GAMEPAD_EP_IN, usb_in_buf, 64);
     if (ret < 0) {
         ep_in_busy = false;
-        pending_active = true;
+        if (ordered)
+            ordered_head = fifo_head;
+        else
+            pending_active = true;
     } else if (!first_usb_send_logged) {
         first_usb_send_logged = true;
         LOG_INF("[USB] First input: [%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]\n",
@@ -685,6 +723,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         usb_configured = true;
         ep_in_busy = false;
         kbd_ep_busy = false;
+        reset_input_tx_state();
         LOG_INF("[USB-EVT] CONFIGURED — host enumeration complete!\n");
         if (hook_configured)
             hook_configured();
@@ -693,6 +732,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         usb_configured = false;
         ep_in_busy = false;
         kbd_ep_busy = false;
+        reset_input_tx_state();
         first_usb_send_logged = false;
         usb_audio_stop();
         usb_audio_mic_stop();
@@ -706,6 +746,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         usb_configured = false;
         ep_in_busy = false;
         kbd_ep_busy = false;
+        reset_input_tx_state();
         usb_audio_stop();
         usb_audio_mic_stop();
         audio_set_mic_active(false);
@@ -725,6 +766,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         LOG_INF("[USB-EVT] CONNECTED (VBUS detected)\n");
         break;
     case USBD_EVENT_DISCONNECTED:
+        reset_input_tx_state();
         LOG_INF("[USB-EVT] DISCONNECTED (VBUS lost)\n");
         break;
     case USBD_EVENT_SET_REMOTE_WAKEUP:
@@ -973,13 +1015,37 @@ void usb_gamepad_set_polling_rate(uint8_t mode)
 ATTR_TCM_SECTION
 int usb_gamepad_send_raw_input(const uint8_t *payload)
 {
-    /* Publish only after the newest report has been copied completely.
-     * If an IN-completion IRQ fires during memcpy it sees no pending report. */
-    pending_active = false;
-    memcpy((void *)pending_payload, payload, DS5_USB_INPUT_PAYLOAD_LEN);
-    pending_active = true;
-    try_send_pending();
-    return 0;
+    uint8_t mode = config_input_report_mode();
+    int ret = 0;
+
+    /* Producer runs in task context. Keep the publish section short so the
+     * USB IN completion IRQ can never consume a half-written report. */
+    taskENTER_CRITICAL();
+    if (mode != input_report_mode_cached) {
+        reset_input_tx_state();
+        input_report_mode_cached = mode;
+    }
+
+    if (mode == INPUT_REPORT_MODE_ORDERED_FIFO) {
+        uint8_t tail = ordered_tail;
+        uint8_t next = (uint8_t)((tail + 1) % USB_INPUT_FIFO_DEPTH);
+        if (next == ordered_head) {
+            ordered_input_drop_count++;
+            ret = -1;
+        } else {
+            memcpy(ordered_payload[tail], payload, DS5_USB_INPUT_PAYLOAD_LEN);
+            ordered_tail = next; /* publish only after full copy */
+        }
+    } else {
+        pending_active = false;
+        memcpy(pending_payload, payload, DS5_USB_INPUT_PAYLOAD_LEN);
+        pending_active = true;
+    }
+    taskEXIT_CRITICAL();
+
+    if (ret == 0)
+        try_send_pending();
+    return ret;
 }
 
 bool usb_gamepad_is_ready(void)

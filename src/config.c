@@ -19,9 +19,17 @@ void config_validate(void)
     if (b->config_version == 2) {
         b->headset_vol_offset = 0;
         b->lock_volume = (b->lock_volume == 1) ? 2 : 0;
-        b->config_version = CONFIG_VERSION;
-        LOG_INF("[CFG] Migrated v2→v3: lock_volume=%d\n",
+        b->config_version = 3;
+        LOG_INF("[CFG] Migrated v2->v3: lock_volume=%d\n",
                 b->lock_volume);
+    }
+    if (b->config_version == 3) {
+        /* New tail bytes are zero after config_load()'s memset for old
+         * serialized records. Set explicitly to document migration policy. */
+        b->input_report_mode = INPUT_REPORT_MODE_REALTIME_LATEST;
+        b->haptic_latency_mode = HAPTIC_LATENCY_BALANCED_1F;
+        b->config_version = 4;
+        LOG_INF("[CFG] Migrated v3->v4: input=realtime haptics=balanced-1f\n");
     } else if (b->config_version != CONFIG_VERSION) {
         LOG_WRN("[CFG] Version mismatch (%d vs %d), resetting\n",
                b->config_version, CONFIG_VERSION);
@@ -84,6 +92,10 @@ void config_validate(void)
         b->tp_click_mode = 0;
     if (b->battery_led > 1)
         b->battery_led = 0;
+    if (b->input_report_mode > INPUT_REPORT_MODE_ORDERED_FIFO)
+        b->input_report_mode = INPUT_REPORT_MODE_REALTIME_LATEST;
+    if (b->haptic_latency_mode > HAPTIC_LATENCY_MAX_2F)
+        b->haptic_latency_mode = HAPTIC_LATENCY_BALANCED_1F;
 }
 
 void config_load(void)
@@ -115,6 +127,8 @@ void config_load(void)
         cfg.tp_mode           = 0;     /* off */
         cfg.tp_mode_enabled_mask = 0x03; /* mode 0 + mode 1 enabled */
         cfg.tp_mouse_sensitivity = 8;
+        cfg.input_report_mode = INPUT_REPORT_MODE_REALTIME_LATEST;
+        cfg.haptic_latency_mode = HAPTIC_LATENCY_BALANCED_1F;
     }
     /* Migrate old 27-byte config: byte 26 was tp_mouse_sensitivity, not mask */
     if (err == 0 && rlen == 27) {
@@ -128,6 +142,8 @@ void config_load(void)
     LOG_INF("[CFG] tp_mode=%u mask=0x%02x sens=%u (rlen=%u)\n",
            cfg.tp_mode, cfg.tp_mode_enabled_mask, cfg.tp_mouse_sensitivity,
            (unsigned)rlen);
+    LOG_INF("[CFG] input_mode=%u haptic_latency=%u\n",
+           cfg.input_report_mode, cfg.haptic_latency_mode);
 }
 
 bool config_save(void)

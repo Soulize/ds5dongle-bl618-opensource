@@ -4,10 +4,29 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Input delivery policy. Zero intentionally preserves the existing
+ * low-latency branch behavior when migrating an older config. */
+enum input_report_mode {
+    INPUT_REPORT_MODE_REALTIME_LATEST = 0,
+    INPUT_REPORT_MODE_ORDERED_FIFO    = 1,
+};
+
+/* Audio/haptics scheduler policy for the single-core BL616.
+ * BALANCED_1F is the current low-latency implementation.
+ * LEGACY_SYNC keeps speaker and haptics time-aligned and waits for both
+ * current Opus frames before submitting 0x39.
+ * MAX_HAPTICS_2F submits haptics before any current-batch Opus work and
+ * therefore keeps speaker one whole 0x39 batch (~21.33 ms) behind. */
+enum haptic_latency_mode {
+    HAPTIC_LATENCY_BALANCED_1F = 0,
+    HAPTIC_LATENCY_LEGACY_SYNC = 1,
+    HAPTIC_LATENCY_MAX_2F      = 2,
+};
+
 /*
- * Configuration body — layout-compatible with DS5Dongle's Config_body
- * for potential companion-app interoperability.  Audio-related fields
- * are preserved but currently ignored on BL618.
+ * Configuration body — layout-compatible with the existing prefix. New
+ * fields are appended only, so v2/v3 data can be migrated without losing
+ * the user's existing settings.
  */
 struct __attribute__((packed)) config_body {
     uint8_t config_version;
@@ -38,9 +57,11 @@ struct __attribute__((packed)) config_body {
     uint8_t audio_haptic;         /* 0=off, 1=auto(game priority), 2=force */
     uint8_t tp_click_mode;        /* 0=touch triggers dirs, 1=click required */
     uint8_t battery_led;          /* bool — show battery level on player LEDs */
+    uint8_t input_report_mode;    /* enum input_report_mode */
+    uint8_t haptic_latency_mode;  /* enum haptic_latency_mode */
 };
 
-#define CONFIG_VERSION  3
+#define CONFIG_VERSION  4
 
 void config_load(void);
 bool config_save(void);
@@ -60,6 +81,8 @@ static inline bool config_dse_detected(void)        { return config_get()->dse_d
 static inline bool config_speaker_disabled(void)    { return config_get()->disable_speaker; }
 static inline bool config_mic_disabled(void)         { return config_get()->disable_mic; }
 static inline uint8_t config_audio_buf_len(void)    { return config_get()->audio_buffer_length; }
+static inline uint8_t config_input_report_mode(void) { return config_get()->input_report_mode; }
+static inline uint8_t config_haptic_latency_mode(void) { return config_get()->haptic_latency_mode; }
 static inline bool config_usb_stealth(void)         { return config_get()->usb_stealth; }
 static inline uint8_t config_apply_hp_offset(uint8_t base)
 {
