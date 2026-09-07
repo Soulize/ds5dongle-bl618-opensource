@@ -643,13 +643,17 @@ static void try_send_pending(void)
 {
     if (!pending_active || !usb_configured || ep_in_busy)
          return;
+    /* Consume exactly one fresh report. Do not continuously pre-arm
+     * the previous controller state after each IN completion. */
+    ep_in_busy = true;
+    pending_active = false;
     usb_in_buf[0] = DS5_USB_REPORT_ID_INPUT;
     memcpy(usb_in_buf + 1, (const void *)pending_payload,
            DS5_USB_INPUT_PAYLOAD_LEN);
-    ep_in_busy = true;
     int ret = usbd_ep_start_write(0, USB_GAMEPAD_EP_IN, usb_in_buf, 64);
     if (ret < 0) {
         ep_in_busy = false;
+        pending_active = true;
     } else if (!first_usb_send_logged) {
         first_usb_send_logged = true;
         LOG_INF("[USB] First input: [%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]\n",
@@ -969,6 +973,9 @@ void usb_gamepad_set_polling_rate(uint8_t mode)
 ATTR_TCM_SECTION
 int usb_gamepad_send_raw_input(const uint8_t *payload)
 {
+    /* Publish only after the newest report has been copied completely.
+     * If an IN-completion IRQ fires during memcpy it sees no pending report. */
+    pending_active = false;
     memcpy((void *)pending_payload, payload, DS5_USB_INPUT_PAYLOAD_LEN);
     pending_active = true;
     try_send_pending();

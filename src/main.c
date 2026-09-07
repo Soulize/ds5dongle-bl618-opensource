@@ -400,9 +400,9 @@ static void on_hid_input(const uint8_t *data, uint16_t len)
             first_input_logged = true;
             LOG_INF("[MAIN] First input report received (%d bytes)\n", len);
         }
-        uint8_t report[DS5_BT_INPUT_REPORT_SIZE];
-        memcpy(report, data, DS5_BT_INPUT_REPORT_SIZE);
-        xQueueOverwrite(input_queue, report);
+        /* xQueueOverwrite copies synchronously; avoid a redundant
+         * stack buffer + memcpy in the BT -> USB hot path. */
+        xQueueOverwrite(input_queue, data);
     }
 }
 
