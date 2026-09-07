@@ -1,0 +1,64 @@
+name: Build BL616 firmware
+
+on:
+  push:
+    branches: [low-latency]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-lctech616:
+    name: LCTech BL616 (${{ matrix.usb_speed }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        usb_speed: [fs, hs]
+
+    steps:
+      - name: Checkout firmware
+        uses: actions/checkout@v7.0.1
+        with:
+          path: ds5dongle
+
+      - name: Checkout Bouffalo SDK
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: sqlCRT/bouffalo_sdk
+          ref: 29daef17f1ff37f83445e54ba20a2659352b6e9e
+          path: bouffalo_sdk
+          submodules: recursive
+
+      - name: Checkout T-Head RISC-V toolchain
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: bouffalolab/toolchain_gcc_t-head_linux
+          ref: c4afe91cbd01bf7dce525e0d23b4219c8691e8f0
+          path: bouffalo_sdk/tools/toolchain_gcc_t-head_linux
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake make ninja-build python3
+          chmod -R +x "${GITHUB_WORKSPACE}/bouffalo_sdk/tools/toolchain_gcc_t-head_linux/bin"
+          echo "${GITHUB_WORKSPACE}/bouffalo_sdk/tools/toolchain_gcc_t-head_linux/bin" >> "$GITHUB_PATH"
+
+      - name: Build firmware
+        working-directory: ds5dongle
+        env:
+          USB_SPEED: ${{ matrix.usb_speed }}
+        run: |
+          chmod +x build_macos.sh build_lctech616.sh
+          ./build_lctech616.sh rebuild
+          find firmware/lctech616 -maxdepth 1 -type f -printf '%f %s bytes\n'
+
+      - name: Upload firmware package
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ds5dongle-lctech616-${{ matrix.usb_speed }}
+          path: ds5dongle/firmware/lctech616/
+          if-no-files-found: error
+          retention-days: 30
