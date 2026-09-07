@@ -35,7 +35,7 @@ jobs:
 
       - name: Apply BL616 haptics-first patch
         working-directory: ds5dongle
-        run: python3 tools/apply_bl616_haptic_first.py
+        run: python3 tools/run_bl616_haptic_first.py
 
       - name: Install host dependencies
         run: |
@@ -58,6 +58,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src/audio.c src/config.c
-          git rm tools/apply_bl616_haptic_first.py .github/workflows/port-bl616-haptic-first.yml
+          git rm tools/apply_bl616_haptic_first.py tools/run_bl616_haptic_first.py .github/workflows/port-bl616-haptic-first.yml
           git commit -m "perf: prioritize haptics on BL616 single-core pipeline"
           git push origin HEAD:low-latency
