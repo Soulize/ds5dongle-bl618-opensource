@@ -26,10 +26,8 @@
 #define OPUS_OUT_SIZE       200     /* CBR output size */
 #define HAPTIC_BUF_SIZE     64      /* 32 stereo int8 pairs */
 #define HAPTIC_DECIMATE     16      /* 48kHz / 3kHz */
-#define ACCUM_SAMPLES       USB_AUDIO_ACCUM_SAMPLES  /* 1024 = 2 Opus frames */
-/* Half-block size: the 1024-sample block is split into two 512-sample halves,
- * each resampled 512→480 and encoded as one Opus frame. */
-#define HALF_ACCUM          (ACCUM_SAMPLES / 2)      /* 512 */
+#define ACCUM_SAMPLES       USB_AUDIO_ACCUM_SAMPLES  /* 512 = one producer frame */
+#define AUDIO_BATCH_FRAMES  2       /* DualSense 0x39 carries two frames */
 
 #define MIC_OPUS_SIZE       71      /* Opus encoded mic frame from DualSense */
 #define MIC_CHANNELS        1       /* Controller sends mono mic */
@@ -89,8 +87,12 @@ static int16_t  mic_dec_peak = 0;
 #endif
 
 /* Double-frame buffers for 0x39 report (2x haptics + 2x opus per packet) */
-static __attribute__((aligned(32))) uint8_t  opus_slots[2][OPUS_OUT_SIZE];
-static __attribute__((aligned(32))) int8_t   haptic_slots[2][HAPTIC_BUF_SIZE];
+static __attribute__((aligned(32))) uint8_t  opus_slots[AUDIO_BATCH_FRAMES][OPUS_OUT_SIZE];
+static __attribute__((aligned(32))) int8_t   haptic_slots[AUDIO_BATCH_FRAMES][HAPTIC_BUF_SIZE];
+static uint8_t  audio_batch_count;
+static bool     audio_batch_speaker;
+static bool     audio_batch_headset;
+static int      audio_batch_channels;
 
 static bool     silence_ready;
 
@@ -155,8 +157,8 @@ static void resamp_sinc_init(void)
 }
 
 /* De-interleaved buffers for SIMD-friendly resample (contiguous L and R) */
-static int16_t resamp_l[HALF_ACCUM];
-static int16_t resamp_r[HALF_ACCUM];
+static int16_t resamp_l[ACCUM_SAMPLES];
+static int16_t resamp_r[ACCUM_SAMPLES];
 
 /* Extract L/R from 4ch USB PCM into contiguous arrays */
 static void deinterleave_4ch(const int16_t *in, int n)
@@ -184,7 +186,7 @@ static void resample_512_480(const int16_t *in_unused, int16_t *out, int mono)
         int32_t sum_r = (1 << 14);
 
         if (center >= SINC_HALF_TAPS - 1 &&
-            center <= HALF_ACCUM - SINC_HALF_TAPS - 1) {
+            center <= ACCUM_SAMPLES - SINC_HALF_TAPS - 1) {
             int base = center - (SINC_HALF_TAPS - 1);
             const int16_t *sl = &resamp_l[base];
             const int16_t *sr = &resamp_r[base];
@@ -227,7 +229,7 @@ static void resample_512_480(const int16_t *in_unused, int16_t *out, int mono)
             for (int t = 0; t < SINC_TAPS; t++) {
                 int idx = center + t - (SINC_HALF_TAPS - 1);
                 if (idx < 0) idx = 0;
-                if (idx >= HALF_ACCUM) idx = HALF_ACCUM - 1;
+                if (idx >= ACCUM_SAMPLES) idx = ACCUM_SAMPLES - 1;
 
                 int16_t coeff = c[t];
                 sum_l += (int32_t)resamp_l[idx] * coeff;
@@ -337,7 +339,7 @@ static bool haptic_channel_silent(const int16_t *in, uint32_t in_samples)
 /* ---- Build and send BT report 0x39 (547 bytes, double-frame) ---- */
 #define AUDIO_SEND_FAIL_MAX  50   /* ~1s @ 21ms/frame → force disconnect */
 
-static int send_audio_report(void)
+static int send_audio_report(bool speaker_enabled, bool headset_output)
 {
     static uint8_t pkt[DS5_BT_AUDIO_REPORT_SIZE];
     memset(pkt, 0, sizeof(pkt));
@@ -365,10 +367,9 @@ static int send_audio_report(void)
     memcpy(pkt + 12, haptic_slots[0], HAPTIC_BUF_SIZE);
     memcpy(pkt + 12 + HAPTIC_BUF_SIZE, haptic_slots[1], HAPTIC_BUF_SIZE);
 
-    /* Speaker Opus (tag 0xD3/0xD6, 2x 200-byte blocks) */
-    bool speaker_enabled = !config_get()->disable_speaker;
+    /* Speaker Opus is optional; haptics producer state is independent. */
     if (speaker_enabled) {
-        pkt[140] = plug_headset ? DS5_AUDIO_TAG_HEADSET : DS5_AUDIO_TAG_SPEAKER;
+        pkt[140] = headset_output ? DS5_AUDIO_TAG_HEADSET : DS5_AUDIO_TAG_SPEAKER;
         pkt[141] = OPUS_OUT_SIZE;
         memcpy(pkt + 142, opus_slots[0], OPUS_OUT_SIZE);
         memcpy(pkt + 142 + OPUS_OUT_SIZE, opus_slots[1], OPUS_OUT_SIZE);
@@ -423,6 +424,7 @@ bool audio_check_respawn(void)
 {
     if (!audio_task_killed) return false;
     audio_task_killed = false;
+    audio_batch_count = 0;
 
     if (audio_task_handle) {
         vTaskDelete(audio_task_handle);
@@ -496,6 +498,10 @@ int audio_init(void)
     mic_first_frame = false;
     memset(opus_slots, 0, sizeof(opus_slots));
     memset(haptic_slots, 0, sizeof(haptic_slots));
+    audio_batch_count = 0;
+    audio_batch_speaker = false;
+    audio_batch_headset = false;
+    audio_batch_channels = 1;
 
     encode_watchdog = xTimerCreate("wd-opus", pdMS_TO_TICKS(WATCHDOG_PERIOD_MS),
                                    pdTRUE, NULL, encode_watchdog_cb);
@@ -619,72 +625,88 @@ void audio_task(void *arg)
                 uint64_t prof_opus = 0;
 #endif
 
-                for (int slot = 0; slot < 2; slot++) {
-                    const uint32_t base = (uint32_t)slot * HALF_ACCUM;
-                    const int16_t *slot_pcm =
-                        &pcm_block[base * USB_AUDIO_CHANNELS];
-
-#if LOG_LEVEL >= 3
-                    uint64_t t_hap0 = bflb_mtimer_get_time_us();
-#endif
-                    if (ah_mode == 2) {
-                        audio_to_haptic(slot_pcm, haptic_slots[slot], HALF_ACCUM);
-                    } else if (ah_mode == 1 &&
-                               haptic_channel_silent(slot_pcm, HALF_ACCUM)) {
-                        audio_to_haptic(slot_pcm, haptic_slots[slot], HALF_ACCUM);
-                    } else {
-                        decimate_haptics(slot_pcm, haptic_slots[slot], HALF_ACCUM);
-                    }
-#if LOG_LEVEL >= 3
-                    prof_haptic += bflb_mtimer_get_time_us() - t_hap0;
-#endif
-
-                    if (speaker_on) {
-#if LOG_LEVEL >= 3
-                        uint64_t t_res0 = bflb_mtimer_get_time_us();
-#endif
-                        deinterleave_4ch(slot_pcm, HALF_ACCUM);
-                        int mono = (encoder_channels == 1);
-                        resample_512_480(slot_pcm, spk_resamp, mono);
-#if LOG_LEVEL >= 3
-                        prof_resamp += bflb_mtimer_get_time_us() - t_res0;
-#endif
-
-                        encode_start_us = bflb_mtimer_get_time_us();
-                        encoding_in_progress = true;
-                        int encoded = opus_encode(encoder, spk_resamp, OPUS_FRAME_SAMPLES,
-                                                  opus_slots[slot], OPUS_OUT_SIZE);
-                        encoding_in_progress = false;
-#if LOG_LEVEL >= 3
-                        prof_opus += bflb_mtimer_get_time_us() - encode_start_us;
-#endif
-
-                        if (encoder_reset_pending) {
-                            encoder_reset_pending = false;
-                            opus_encoder_ctl(encoder, OPUS_RESET_STATE);
-                        }
-                        if (encoded <= 0) {
-                            LOG_ERR("[AUDIO] Opus encode error: %d\n", encoded);
-                            memset(opus_slots[slot], 0, OPUS_OUT_SIZE);
-                        } else if (encoded < OPUS_OUT_SIZE) {
-                            int pad_ret = opus_packet_pad(
-                                opus_slots[slot], encoded, OPUS_OUT_SIZE);
-                            if (pad_ret != OPUS_OK)
-                                memset(opus_slots[slot] + encoded, 0,
-                                       OPUS_OUT_SIZE - encoded);
-                        }
-                    } else {
-                        memset(opus_slots[slot], 0, OPUS_OUT_SIZE);
-                    }
-
-                    if (slot == 0 && mic_enabled)
-                        vTaskDelay(pdMS_TO_TICKS(1));
+                /* DS5_Bridge-style producer separation: process one 512-sample
+                   USB frame as soon as it is complete. The Bluetooth 0x39 format
+                   remains a two-frame compositor. */
+                if (audio_batch_count != 0 &&
+                    (audio_batch_speaker != speaker_on ||
+                     audio_batch_headset != plug_headset ||
+                     audio_batch_channels != target_channels)) {
+                    audio_batch_count = 0;
                 }
+                if (audio_batch_count == 0) {
+                    audio_batch_speaker = speaker_on;
+                    audio_batch_headset = plug_headset;
+                    audio_batch_channels = target_channels;
+                }
+
+                const int slot = audio_batch_count;
+                const int16_t *slot_pcm = pcm_block;
+
+#if LOG_LEVEL >= 3
+                uint64_t t_hap0 = bflb_mtimer_get_time_us();
+#endif
+                if (ah_mode == 2) {
+                    audio_to_haptic(slot_pcm, haptic_slots[slot], ACCUM_SAMPLES);
+                } else if (ah_mode == 1 &&
+                           haptic_channel_silent(slot_pcm, ACCUM_SAMPLES)) {
+                    audio_to_haptic(slot_pcm, haptic_slots[slot], ACCUM_SAMPLES);
+                } else {
+                    decimate_haptics(slot_pcm, haptic_slots[slot], ACCUM_SAMPLES);
+                }
+#if LOG_LEVEL >= 3
+                prof_haptic += bflb_mtimer_get_time_us() - t_hap0;
+#endif
+
+                /* Optional speaker producer. Frame 0 is encoded roughly one USB
+                 * producer period earlier than with the old 1024-sample batch. */
+                if (speaker_on) {
+#if LOG_LEVEL >= 3
+                    uint64_t t_res0 = bflb_mtimer_get_time_us();
+#endif
+                    deinterleave_4ch(slot_pcm, ACCUM_SAMPLES);
+                    int mono = (encoder_channels == 1);
+                    resample_512_480(slot_pcm, spk_resamp, mono);
+#if LOG_LEVEL >= 3
+                    prof_resamp += bflb_mtimer_get_time_us() - t_res0;
+#endif
+
+                    encode_start_us = bflb_mtimer_get_time_us();
+                    encoding_in_progress = true;
+                    int encoded = opus_encode(encoder, spk_resamp, OPUS_FRAME_SAMPLES,
+                                              opus_slots[slot], OPUS_OUT_SIZE);
+                    encoding_in_progress = false;
+#if LOG_LEVEL >= 3
+                    prof_opus += bflb_mtimer_get_time_us() - encode_start_us;
+#endif
+                    if (encoder_reset_pending) {
+                        encoder_reset_pending = false;
+                        opus_encoder_ctl(encoder, OPUS_RESET_STATE);
+                    }
+                    if (encoded <= 0) {
+                        LOG_ERR("[AUDIO] Opus encode error: %d\n", encoded);
+                        memset(opus_slots[slot], 0, OPUS_OUT_SIZE);
+                    } else if (encoded < OPUS_OUT_SIZE) {
+                        int pad_ret = opus_packet_pad(opus_slots[slot], encoded, OPUS_OUT_SIZE);
+                        if (pad_ret != OPUS_OK)
+                            memset(opus_slots[slot] + encoded, 0, OPUS_OUT_SIZE - encoded);
+                    }
+                } else {
+                    memset(opus_slots[slot], 0, OPUS_OUT_SIZE);
+                }
+
+                audio_batch_count++;
+                if (audio_batch_count < AUDIO_BATCH_FRAMES)
+                    goto audio_frame_done;
+
+                /* Both haptic slots are ready. Do not insert the old fixed 1ms
+                 * mic delay; mic decode already runs in its own FreeRTOS task. */
+                audio_batch_count = 0;
 
 #if LOG_LEVEL >= 3
                 uint64_t t_send0 = bflb_mtimer_get_time_us();
 #endif
-                int send_ret = send_audio_report();
+                int send_ret = send_audio_report(audio_batch_speaker, audio_batch_headset);
 
                 if (send_ret != 0) {
                     send_fail_streak++;
@@ -761,6 +783,8 @@ void audio_task(void *arg)
                     }
                 }
 #endif
+            audio_frame_done:
+                ;
             }
         }
 
@@ -791,6 +815,7 @@ void audio_reset(void)
     encoder_params_dirty = false;
     memset(opus_slots, 0, sizeof(opus_slots));
     memset(haptic_slots, 0, sizeof(haptic_slots));
+    audio_batch_count = 0;
     if (encoding_in_progress) {
         encoder_reset_pending = true;
     } else if (encoder) {
@@ -807,6 +832,7 @@ void audio_reset_encoder(void)
 {
     memset(opus_slots, 0, sizeof(opus_slots));
     memset(haptic_slots, 0, sizeof(haptic_slots));
+    audio_batch_count = 0;
     if (encoding_in_progress) {
         encoder_reset_pending = true;
     } else if (encoder) {

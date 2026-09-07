@@ -5,6 +5,7 @@
 #include "usbd_audio.h"
 #include "FreeRTOS.h"
 #include "semphr.h"
+#include "task.h"
 #include <string.h>
 #include "debug_log.h"
 #include "bflb_mtimer.h"
@@ -176,15 +177,19 @@ static const uint8_t audio_desc[AUDIO_DESC_SIZE] = {
     0x00, 0x00, 0x00, 0x00,
 };
 
-/* ---- Double buffer for ISO PCM accumulation ---- */
+/* ---- Low-latency PCM frame ring ----
+ * One buffer is being filled while up to two complete 512-sample frames
+ * wait for audio_task. Memory use is lower than the old 2x1024 ping-pong. */
 #define PCM_BUF_SAMPLES  USB_AUDIO_ACCUM_SAMPLES
 #define PCM_BUF_BYTES    (PCM_BUF_SAMPLES * USB_AUDIO_CHANNELS * sizeof(int16_t))
+#define PCM_BUF_COUNT    3
+#define PCM_READY_MAX    (PCM_BUF_COUNT - 1)
 
-static int16_t pcm_buf[2][PCM_BUF_SAMPLES * USB_AUDIO_CHANNELS];
+static int16_t pcm_buf[PCM_BUF_COUNT][PCM_BUF_SAMPLES * USB_AUDIO_CHANNELS];
 static volatile uint32_t pcm_write_pos = 0;
 static volatile uint8_t  pcm_write_idx = 0;
-static volatile bool     pcm_ready = false;
-static uint8_t           pcm_read_idx = 0;
+static volatile uint8_t  pcm_read_idx = 0;
+static volatile uint8_t  pcm_ready_count = 0;
 
 static SemaphoreHandle_t audio_sem;
 static StaticSemaphore_t audio_sem_buf;
@@ -265,10 +270,18 @@ static void audio_ep_out_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
 
         if (pos >= PCM_BUF_SAMPLES * USB_AUDIO_CHANNELS) {
             pcm_write_pos = 0;
-            pcm_write_idx ^= 1;
-            pcm_ready = true;
+
             BaseType_t woken = pdFALSE;
-            xSemaphoreGiveFromISR(audio_sem, &woken);
+            if (pcm_ready_count < PCM_READY_MAX) {
+                pcm_ready_count++;
+                pcm_write_idx = (uint8_t)((pcm_write_idx + 1) % PCM_BUF_COUNT);
+                xSemaphoreGiveFromISR(audio_sem, &woken);
+            } else {
+                /* Backlog full: discard oldest complete frame and keep
+                 * the newest two instead of growing output latency. */
+                pcm_read_idx = (uint8_t)((pcm_read_idx + 1) % PCM_BUF_COUNT);
+                pcm_write_idx = (uint8_t)((pcm_write_idx + 1) % PCM_BUF_COUNT);
+            }
             portYIELD_FROM_ISR(woken);
         } else {
             pcm_write_pos = pos;
@@ -327,7 +340,8 @@ void usbd_audio_open(uint8_t busid, uint8_t intf)
         stream_active = true;
         pcm_write_pos = 0;
         pcm_write_idx = 0;
-        pcm_ready = false;
+        pcm_read_idx = 0;
+        pcm_ready_count = 0;
         state_mgr_set_spk_active(true);
         int r = usbd_ep_start_read(busid, USB_AUDIO_EP_OUT, iso_rx_buf, sizeof(iso_rx_buf));
         if (r < 0)
@@ -396,7 +410,7 @@ uint32_t usbd_audio_get_sampling_freq(uint8_t busid, uint8_t ep)
 void usb_audio_early_init(void)
 {
     if (!audio_sem)
-        audio_sem = xSemaphoreCreateCountingStatic(2, 0, &audio_sem_buf);
+        audio_sem = xSemaphoreCreateCountingStatic(PCM_READY_MAX, 0, &audio_sem_buf);
 }
 
 void usb_audio_register(uint8_t busid)
@@ -447,19 +461,28 @@ void usb_audio_stop(void)
     stream_active = false;
     pcm_write_pos = 0;
     pcm_write_idx = 0;
-    pcm_ready = false;
+    pcm_read_idx = 0;
+    pcm_ready_count = 0;
     state_mgr_set_spk_active(false);
 }
 
 bool usb_audio_read(int16_t *out)
 {
-    if (!pcm_ready)
-        return false;
+    bool ok = false;
 
-    pcm_read_idx = pcm_write_idx ^ 1;
-    memcpy(out, pcm_buf[pcm_read_idx], PCM_BUF_BYTES);
-    pcm_ready = false;
-    return true;
+    /* Prevent the ISO ISR from recycling the selected 4KB frame while
+     * it is copied. The critical section is tiny versus the 1ms USB
+     * audio cadence and gives deterministic ring ownership. */
+    taskENTER_CRITICAL();
+    if (pcm_ready_count != 0) {
+        uint8_t idx = pcm_read_idx;
+        memcpy(out, pcm_buf[idx], PCM_BUF_BYTES);
+        pcm_read_idx = (uint8_t)((pcm_read_idx + 1) % PCM_BUF_COUNT);
+        pcm_ready_count--;
+        ok = true;
+    }
+    taskEXIT_CRITICAL();
+    return ok;
 }
 
 void *usb_audio_get_semaphore(void)

@@ -20,11 +20,11 @@
 #define USB_AUDIO_MIC_CHANNELS  2
 #define USB_AUDIO_MIC_MPS       196
 
-/* 1024 samples per channel accumulated before processing.
- * 1024/48000 = 21.33ms = exactly 2 Opus frames per BT report.
- * Using 1024 instead of 512 means ONE semaphore per BT send cycle,
- * eliminating back-to-back semaphore bursts that cause stutter on Linux. */
-#define USB_AUDIO_ACCUM_SAMPLES 1024
+/* One 512-sample producer frame per channel.
+ * 512/48000 = 10.67ms. audio.c prepares haptics/Opus per frame,
+ * then batches two prepared frames into the unchanged DualSense 0x39.
+ * A two-frame ready backlog absorbs short scheduler stalls. */
+#define USB_AUDIO_ACCUM_SAMPLES 512
 
 /* Mic ring buffer: 4 Opus frames of stereo samples (was 2, expanded for
  * more USB ISO IN jitter tolerance to prevent underflow/pop artifacts) */
