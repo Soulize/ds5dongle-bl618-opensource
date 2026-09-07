@@ -12,15 +12,16 @@ enum input_report_mode {
 };
 
 /* Audio/haptics scheduler policy for the single-core BL616.
- * BALANCED_1F is the current low-latency implementation.
- * LEGACY_SYNC keeps speaker and haptics time-aligned and waits for both
- * current Opus frames before submitting 0x39.
- * MAX_HAPTICS_2F submits haptics before any current-batch Opus work and
- * therefore keeps speaker one whole 0x39 batch (~21.33 ms) behind. */
+ * BALANCED_1F prioritizes haptics by keeping speaker one 512-sample frame behind.
+ * LEGACY_SYNC keeps speaker/haptics aligned but defers both current Opus encodes.
+ * MAX_HAPTICS_2F keeps speaker a full 0x39 batch behind.
+ * LOW_SYNC keeps speaker/haptics aligned while pre-encoding frame 0 during the
+ * first 10.67 ms window, leaving only frame-1 Opus on the haptics critical path. */
 enum haptic_latency_mode {
     HAPTIC_LATENCY_BALANCED_1F = 0,
     HAPTIC_LATENCY_LEGACY_SYNC = 1,
     HAPTIC_LATENCY_MAX_2F      = 2,
+    HAPTIC_LATENCY_LOW_SYNC    = 3,
 };
 
 /*

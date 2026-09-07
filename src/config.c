@@ -94,7 +94,7 @@ void config_validate(void)
         b->battery_led = 0;
     if (b->input_report_mode > INPUT_REPORT_MODE_ORDERED_FIFO)
         b->input_report_mode = INPUT_REPORT_MODE_REALTIME_LATEST;
-    if (b->haptic_latency_mode > HAPTIC_LATENCY_MAX_2F)
+    if (b->haptic_latency_mode > HAPTIC_LATENCY_LOW_SYNC)
         b->haptic_latency_mode = HAPTIC_LATENCY_BALANCED_1F;
 }
 

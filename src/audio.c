@@ -734,7 +734,11 @@ void audio_task(void *arg)
                     speaker_pipeline_primed = false;
                 }
 
-                if (!speaker_on || latency_mode == HAPTIC_LATENCY_LEGACY_SYNC) {
+                if (!speaker_on ||
+                    latency_mode == HAPTIC_LATENCY_LEGACY_SYNC ||
+                    latency_mode == HAPTIC_LATENCY_LOW_SYNC) {
+                    /* Synchronized modes always send the two current Opus
+                     * frames, so they never need lag-pipeline silence priming. */
                     speaker_pipeline_primed = false;
                 } else if (!speaker_pipeline_primed) {
                     prime_speaker_pipeline(target_channels);
@@ -766,13 +770,24 @@ void audio_task(void *arg)
 
                 if (speaker_on && slot == 0) {
                     if (latency_mode == HAPTIC_LATENCY_BALANCED_1F) {
-                        /* Current low-latency policy: encode frame 0 during the
-                         * first 10.67ms window. At send time speaker contains
+                        /* Haptics-first one-frame lag: encode current frame 0
+                         * during the first 10.67ms window. The outgoing pair is
                          * [previous frame1, current frame0]. */
 #if LOG_LEVEL >= 3
                         uint64_t t_op0 = bflb_mtimer_get_time_us();
 #endif
                         encode_speaker_frame(slot_pcm, opus_slots[1]);
+#if LOG_LEVEL >= 3
+                        prof_opus += bflb_mtimer_get_time_us() - t_op0;
+#endif
+                    } else if (latency_mode == HAPTIC_LATENCY_LOW_SYNC) {
+                        /* Synchronized low-latency mode: pre-encode current
+                         * frame 0 now. Frame 1 will be the only Opus encode on
+                         * the second-frame/haptics critical path. */
+#if LOG_LEVEL >= 3
+                        uint64_t t_op0 = bflb_mtimer_get_time_us();
+#endif
+                        encode_speaker_frame(slot_pcm, opus_slots[0]);
 #if LOG_LEVEL >= 3
                         prof_opus += bflb_mtimer_get_time_us() - t_op0;
 #endif
@@ -802,6 +817,17 @@ void audio_task(void *arg)
                     encode_speaker_frame(slot_pcm, opus_slots[1]);
 #if LOG_LEVEL >= 3
                     prof_opus += bflb_mtimer_get_time_us() - t_op_legacy;
+#endif
+                } else if (speaker_on && latency_mode == HAPTIC_LATENCY_LOW_SYNC) {
+                    /* Frame 0 was encoded during the first 10.67ms window.
+                     * Encode only the just-arrived frame 1, then submit the
+                     * aligned current haptics + current speaker pair. */
+#if LOG_LEVEL >= 3
+                    uint64_t t_op_low_sync = bflb_mtimer_get_time_us();
+#endif
+                    encode_speaker_frame(slot_pcm, opus_slots[1]);
+#if LOG_LEVEL >= 3
+                    prof_opus += bflb_mtimer_get_time_us() - t_op_low_sync;
 #endif
                 }
 
