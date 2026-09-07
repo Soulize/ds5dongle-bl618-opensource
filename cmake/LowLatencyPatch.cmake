@@ -3,6 +3,7 @@
 # against upstream easily. Every replacement is checked: if upstream changes the
 # hot path, configuration fails instead of silently applying a stale patch.
 
+get_filename_component(LOW_LATENCY_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 set(LOW_LATENCY_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/low_latency")
 file(MAKE_DIRECTORY "${LOW_LATENCY_GEN_DIR}")
 
@@ -21,7 +22,7 @@ function(_ll_replace_once var_name old_text new_text label)
 endfunction()
 
 # ---- USB HID input hot path -------------------------------------------------
-file(READ "${CMAKE_CURRENT_LIST_DIR}/src/usb_gamepad.c" _ll_usb)
+file(READ "${LOW_LATENCY_ROOT}/src/usb_gamepad.c" _ll_usb)
 
 # Consume a fresh pending report when it is submitted to USB. The upstream
 # implementation leaves pending_active=true after a successful submission, so
@@ -48,6 +49,26 @@ set(_new_usb_submit [=[    /* Claim this fresh report before arming the endpoint
         pending_active = true;]=])
 _ll_replace_once(_ll_usb "${_old_usb_submit}" "${_new_usb_submit}" "fresh-report USB IN")
 
+# Publish pending_payload only after its 63-byte copy is complete. If an IN
+# completion interrupt fires during this copy it sees pending_active=false and
+# leaves the endpoint idle; the task then publishes the complete newest report.
+set(_old_publish [=[int usb_gamepad_send_raw_input(const uint8_t *payload)
+{
+    memcpy((void *)pending_payload, payload, DS5_USB_INPUT_PAYLOAD_LEN);
+    pending_active = true;
+    try_send_pending();
+    return 0;
+}]=])
+set(_new_publish [=[int usb_gamepad_send_raw_input(const uint8_t *payload)
+{
+    pending_active = false;
+    memcpy((void *)pending_payload, payload, DS5_USB_INPUT_PAYLOAD_LEN);
+    pending_active = true;
+    try_send_pending();
+    return 0;
+}]=])
+_ll_replace_once(_ll_usb "${_old_publish}" "${_new_publish}" "atomic pending report publish")
+
 # HS realtime mode: 2^(2-1) * 125 us = 250 us host polling interval.
 # Bluetooth remains the limiting report source (~750 Hz), so this reduces USB
 # phase wait without generating duplicate reports after the fresh-report fix.
@@ -59,7 +80,7 @@ set(LOW_LATENCY_USB_GAMEPAD_SOURCE "${LOW_LATENCY_GEN_DIR}/usb_gamepad.c")
 file(WRITE "${LOW_LATENCY_USB_GAMEPAD_SOURCE}" "${_ll_usb}")
 
 # ---- Bluetooth -> USB handoff -----------------------------------------------
-file(READ "${CMAKE_CURRENT_LIST_DIR}/src/main.c" _ll_main)
+file(READ "${LOW_LATENCY_ROOT}/src/main.c" _ll_main)
 
 # FreeRTOS xQueueOverwrite copies the item synchronously. Avoid copying the
 # whole Bluetooth input report into a temporary stack array first.
