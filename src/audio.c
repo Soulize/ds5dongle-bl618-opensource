@@ -89,10 +89,18 @@ static int16_t  mic_dec_peak = 0;
 /* Double-frame buffers for 0x39 report (2x haptics + 2x opus per packet) */
 static __attribute__((aligned(32))) uint8_t  opus_slots[AUDIO_BATCH_FRAMES][OPUS_OUT_SIZE];
 static __attribute__((aligned(32))) int8_t   haptic_slots[AUDIO_BATCH_FRAMES][HAPTIC_BUF_SIZE];
+/* Cached valid Opus silence for haptics-first speaker priming. */
+static __attribute__((aligned(32))) uint8_t  opus_silence_mono[OPUS_OUT_SIZE];
+static __attribute__((aligned(32))) uint8_t  opus_silence_stereo[OPUS_OUT_SIZE];
 static uint8_t  audio_batch_count;
 static bool     audio_batch_speaker;
 static bool     audio_batch_headset;
 static int      audio_batch_channels;
+/* BL616 is single-core: keep speaker one 10.67ms source frame behind haptics.
+ * opus_slots[0] is the previous encoded frame (lag), opus_slots[1] is the
+ * first frame of the current haptics batch. The second current speaker frame
+ * is encoded only AFTER the current haptics packet has been submitted. */
+static bool     speaker_pipeline_primed;
 
 static bool     silence_ready;
 
@@ -250,6 +258,52 @@ static void resample_512_480(const int16_t *in_unused, int16_t *out, int mono)
             out[i * 2 + 1] = (int16_t)r;
         }
     }
+}
+
+/* Pad a CELT/Opus packet to the fixed 200-byte DualSense block. */
+static void opus_pad_fixed(uint8_t *dst, int encoded)
+{
+    if (encoded <= 0) {
+        memset(dst, 0, OPUS_OUT_SIZE);
+        return;
+    }
+    if (encoded < OPUS_OUT_SIZE) {
+        int pad_ret = opus_packet_pad(dst, encoded, OPUS_OUT_SIZE);
+        if (pad_ret != OPUS_OK)
+            memset(dst + encoded, 0, OPUS_OUT_SIZE - encoded);
+    }
+}
+
+/* Encode one 512-sample USB source frame into one 10ms / 200-byte block. */
+static int encode_speaker_frame(const int16_t *slot_pcm, uint8_t *dst)
+{
+    deinterleave_4ch(slot_pcm, ACCUM_SAMPLES);
+    int mono = (encoder_channels == 1);
+    resample_512_480(slot_pcm, spk_resamp, mono);
+
+    encode_start_us = bflb_mtimer_get_time_us();
+    encoding_in_progress = true;
+    int encoded = opus_encode(encoder, spk_resamp, OPUS_FRAME_SAMPLES,
+                              dst, OPUS_OUT_SIZE);
+    encoding_in_progress = false;
+
+    if (encoder_reset_pending) {
+        encoder_reset_pending = false;
+        opus_encoder_ctl(encoder, OPUS_RESET_STATE);
+        speaker_pipeline_primed = false;
+    }
+    if (encoded <= 0)
+        LOG_ERR("[AUDIO] Opus encode error: %d\n", encoded);
+    opus_pad_fixed(dst, encoded);
+    return encoded;
+}
+
+static void prime_speaker_pipeline(int channels)
+{
+    const uint8_t *silence = (channels == 2)
+                           ? opus_silence_stereo : opus_silence_mono;
+    memcpy(opus_slots[0], silence, OPUS_OUT_SIZE);
+    speaker_pipeline_primed = true;
 }
 
 /* ---- Haptics: 16:1 point-sample decimation (stereo int16 → stereo int8) ----
@@ -425,6 +479,7 @@ bool audio_check_respawn(void)
     if (!audio_task_killed) return false;
     audio_task_killed = false;
     audio_batch_count = 0;
+    speaker_pipeline_primed = false;
 
     if (audio_task_handle) {
         vTaskDelete(audio_task_handle);
@@ -469,7 +524,44 @@ int audio_init(void)
     opus_encoder_ctl(encoder, OPUS_SET_BITRATE(160000));
     opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
     opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
-    /* 1ch (no headset): full quality — prediction enabled, full bandwidth */
+    opus_encoder_ctl(encoder, OPUS_SET_PREDICTION_DISABLED(1));
+
+    /* Build valid fixed-size silence primers outside the realtime path. */
+    memset(spk_resamp, 0, sizeof(spk_resamp));
+    int silence_encoded = opus_encode(encoder, spk_resamp,
+                                      OPUS_FRAME_SAMPLES,
+                                      opus_silence_mono, OPUS_OUT_SIZE);
+    opus_pad_fixed(opus_silence_mono, silence_encoded);
+
+    if (opus_encoder_init(encoder, 48000, 2,
+                          OPUS_APPLICATION_RESTRICTED_CELT) == OPUS_OK) {
+        opus_encoder_ctl(encoder, OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
+        opus_encoder_ctl(encoder, OPUS_SET_BITRATE(128000));
+        opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
+        opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
+        opus_encoder_ctl(encoder, OPUS_SET_PREDICTION_DISABLED(1));
+        silence_encoded = opus_encode(encoder, spk_resamp,
+                                      OPUS_FRAME_SAMPLES,
+                                      opus_silence_stereo, OPUS_OUT_SIZE);
+        opus_pad_fixed(opus_silence_stereo, silence_encoded);
+    } else {
+        memset(opus_silence_stereo, 0, sizeof(opus_silence_stereo));
+    }
+
+    /* Restore the normal startup encoder after building the primers. */
+    err = opus_encoder_init(encoder, 48000, 1,
+                            OPUS_APPLICATION_RESTRICTED_CELT);
+    if (err != OPUS_OK) {
+        LOG_ERR("[AUDIO] Opus encoder restore failed: %d\n", err);
+        return -1;
+    }
+    opus_encoder_ctl(encoder, OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
+    opus_encoder_ctl(encoder, OPUS_SET_BITRATE(160000));
+    opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
+    opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
+    opus_encoder_ctl(encoder, OPUS_SET_PREDICTION_DISABLED(1));
+
+    /* 1ch (no headset): low-latency CELT — prediction disabled */
     encoder_channels = 1;
     encoder_cpu_save = false;
     encoder_params_dirty = true; /* force apply on first frame */
@@ -502,6 +594,7 @@ int audio_init(void)
     audio_batch_speaker = false;
     audio_batch_headset = false;
     audio_batch_channels = 1;
+    speaker_pipeline_primed = false;
 
     encode_watchdog = xTimerCreate("wd-opus", pdMS_TO_TICKS(WATCHDOG_PERIOD_MS),
                                    pdTRUE, NULL, encode_watchdog_cb);
@@ -586,6 +679,7 @@ void audio_task(void *arg)
                     if (reinit_err == OPUS_OK) {
                         encoder_channels = target_channels;
                         encoder_params_dirty = true; /* force re-apply below */
+                        speaker_pipeline_primed = false;
                         LOG_INF("[AUDIO] Encoder reinit %dch\n", target_channels);
                     } else {
                         LOG_ERR("[AUDIO] Encoder reinit %dch failed: %d\n",
@@ -595,7 +689,7 @@ void audio_task(void *arg)
 
                 /* Dynamic encoder tuning:
                  * - Headset + mic active → CPU-save (128k, pred off, SWB)
-                 * - Otherwise            → full quality (160k, pred on, full BW)
+                 * - Otherwise            → low-latency quality (160k, pred off, full BW)
                  * Only re-apply when state changes to avoid per-frame ctl overhead. */
                 bool need_cpu_save = (encoder_channels == 2 && mic_enabled);
                 if (need_cpu_save != encoder_cpu_save || encoder_params_dirty) {
@@ -611,7 +705,7 @@ void audio_task(void *arg)
                         LOG_INF("[AUDIO] Encoder → CPU-save (headset+mic)\n");
                     } else {
                         opus_encoder_ctl(encoder, OPUS_SET_BITRATE(160000));
-                        opus_encoder_ctl(encoder, OPUS_SET_PREDICTION_DISABLED(0));
+                        opus_encoder_ctl(encoder, OPUS_SET_PREDICTION_DISABLED(1));
                         opus_encoder_ctl(encoder, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_FULLBAND));
                         LOG_INF("[AUDIO] Encoder → full quality\n");
                     }
@@ -633,7 +727,12 @@ void audio_task(void *arg)
                      audio_batch_headset != plug_headset ||
                      audio_batch_channels != target_channels)) {
                     audio_batch_count = 0;
+                    speaker_pipeline_primed = false;
                 }
+                if (!speaker_on)
+                    speaker_pipeline_primed = false;
+                if (speaker_on && !speaker_pipeline_primed)
+                    prime_speaker_pipeline(target_channels);
                 if (audio_batch_count == 0) {
                     audio_batch_speaker = speaker_on;
                     audio_batch_headset = plug_headset;
@@ -658,41 +757,20 @@ void audio_task(void *arg)
                 prof_haptic += bflb_mtimer_get_time_us() - t_hap0;
 #endif
 
-                /* Optional speaker producer. Frame 0 is encoded roughly one USB
-                 * producer period earlier than with the old 1024-sample batch. */
-                if (speaker_on) {
+                /* BL616 single-core haptics-first scheduler.
+                 * Frame 0: encode speaker immediately during the 10.67ms slack.
+                 * Frame 1: DO NOT encode yet. The current haptics pair is now
+                 * complete, so submit it first with [previous speaker, frame0].
+                 * Frame 1 speaker is encoded after BT submission and becomes
+                 * the previous frame for the next batch. */
+                if (speaker_on && slot == 0) {
 #if LOG_LEVEL >= 3
-                    uint64_t t_res0 = bflb_mtimer_get_time_us();
+                    uint64_t t_op0 = bflb_mtimer_get_time_us();
 #endif
-                    deinterleave_4ch(slot_pcm, ACCUM_SAMPLES);
-                    int mono = (encoder_channels == 1);
-                    resample_512_480(slot_pcm, spk_resamp, mono);
+                    encode_speaker_frame(slot_pcm, opus_slots[1]);
 #if LOG_LEVEL >= 3
-                    prof_resamp += bflb_mtimer_get_time_us() - t_res0;
+                    prof_opus += bflb_mtimer_get_time_us() - t_op0;
 #endif
-
-                    encode_start_us = bflb_mtimer_get_time_us();
-                    encoding_in_progress = true;
-                    int encoded = opus_encode(encoder, spk_resamp, OPUS_FRAME_SAMPLES,
-                                              opus_slots[slot], OPUS_OUT_SIZE);
-                    encoding_in_progress = false;
-#if LOG_LEVEL >= 3
-                    prof_opus += bflb_mtimer_get_time_us() - encode_start_us;
-#endif
-                    if (encoder_reset_pending) {
-                        encoder_reset_pending = false;
-                        opus_encoder_ctl(encoder, OPUS_RESET_STATE);
-                    }
-                    if (encoded <= 0) {
-                        LOG_ERR("[AUDIO] Opus encode error: %d\n", encoded);
-                        memset(opus_slots[slot], 0, OPUS_OUT_SIZE);
-                    } else if (encoded < OPUS_OUT_SIZE) {
-                        int pad_ret = opus_packet_pad(opus_slots[slot], encoded, OPUS_OUT_SIZE);
-                        if (pad_ret != OPUS_OK)
-                            memset(opus_slots[slot] + encoded, 0, OPUS_OUT_SIZE - encoded);
-                    }
-                } else {
-                    memset(opus_slots[slot], 0, OPUS_OUT_SIZE);
                 }
 
                 audio_batch_count++;
@@ -783,6 +861,11 @@ void audio_task(void *arg)
                     }
                 }
 #endif
+                if (speaker_on) {
+                    /* Current haptics are already in the Bluetooth stack. */
+                    encode_speaker_frame(slot_pcm, opus_slots[0]);
+                    speaker_pipeline_primed = true;
+                }
             audio_frame_done:
                 ;
             }
@@ -816,6 +899,7 @@ void audio_reset(void)
     memset(opus_slots, 0, sizeof(opus_slots));
     memset(haptic_slots, 0, sizeof(haptic_slots));
     audio_batch_count = 0;
+    speaker_pipeline_primed = false;
     if (encoding_in_progress) {
         encoder_reset_pending = true;
     } else if (encoder) {
@@ -833,6 +917,7 @@ void audio_reset_encoder(void)
     memset(opus_slots, 0, sizeof(opus_slots));
     memset(haptic_slots, 0, sizeof(haptic_slots));
     audio_batch_count = 0;
+    speaker_pipeline_primed = false;
     if (encoding_in_progress) {
         encoder_reset_pending = true;
     } else if (encoder) {
