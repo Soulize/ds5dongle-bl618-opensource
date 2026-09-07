@@ -1,0 +1,73 @@
+name: Validate configurable latency modes
+
+on:
+  push:
+    branches: [low-latency]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-commit:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout firmware
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: low-latency
+          path: ds5dongle
+          fetch-depth: 0
+
+      - name: Checkout Bouffalo SDK
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: sqlCRT/bouffalo_sdk
+          ref: 29daef17f1ff37f83445e54ba20a2659352b6e9e
+          path: bouffalo_sdk
+          submodules: recursive
+
+      - name: Checkout T-Head toolchain
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: bouffalolab/toolchain_gcc_t-head_linux
+          ref: c4afe91cbd01bf7dce525e0d23b4219c8691e8f0
+          path: bouffalo_sdk/tools/toolchain_gcc_t-head_linux
+
+      - name: Apply selectable latency modes
+        working-directory: ds5dongle
+        run: python3 tools/apply_configurable_latency_modes.py
+
+      - name: Verify mode invariants
+        working-directory: ds5dongle
+        run: |
+          grep -q '#define CONFIG_VERSION  4' src/config.h
+          grep -q 'INPUT_REPORT_MODE_ORDERED_FIFO' src/main.c
+          grep -q 'USB_INPUT_FIFO_DEPTH 16' src/usb_gamepad.c
+          grep -q 'HAPTIC_LATENCY_LEGACY_SYNC' src/audio.c
+          grep -q 'HAPTIC_LATENCY_MAX_2F' src/audio.c
+          grep -q 'default: interval = 3; break;' src/usb_gamepad.c
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake make ninja-build python3
+          chmod -R +x "${GITHUB_WORKSPACE}/bouffalo_sdk/tools/toolchain_gcc_t-head_linux/bin"
+          echo "${GITHUB_WORKSPACE}/bouffalo_sdk/tools/toolchain_gcc_t-head_linux/bin" >> "$GITHUB_PATH"
+
+      - name: Build LCTech BL616 HS
+        working-directory: ds5dongle
+        env:
+          USB_SPEED: hs
+        run: |
+          chmod +x build_macos.sh build_lctech616.sh
+          ./build_lctech616.sh rebuild
+
+      - name: Commit validated source changes
+        working-directory: ds5dongle
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/config.h src/config.c src/main.c src/usb_gamepad.c src/audio.c
+          git rm tools/apply_configurable_latency_modes.py .github/workflows/port-configurable-latency-modes.yml
+          git commit -m "feat: add selectable input and haptics latency modes"
+          git push origin HEAD:low-latency
