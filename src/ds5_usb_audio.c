@@ -177,19 +177,60 @@ static const uint8_t audio_desc[AUDIO_DESC_SIZE] = {
     0x00, 0x00, 0x00, 0x00,
 };
 
-/* ---- Low-latency PCM frame ring ----
- * One buffer is being filled while up to two complete 512-sample frames
- * wait for audio_task. Memory use is lower than the old 2x1024 ping-pong. */
+/* ---- Zero-copy low-latency PCM ownership ring -------------------------
+ * BL616 is single-core. Three 512-frame buffers are enough for exactly:
+ *   1 WRITING in the USB ISO ISR + 1 READING in audio_task + 1 READY latest.
+ * There is intentionally no deep FIFO: when the consumer falls behind, the
+ * old READY frame is dropped and replaced by the newest completed frame.
+ * This bounds latency and removes the old 4KB memcpy while interrupts were
+ * disabled every 10.67ms. */
 #define PCM_BUF_SAMPLES  USB_AUDIO_ACCUM_SAMPLES
-#define PCM_BUF_BYTES    (PCM_BUF_SAMPLES * USB_AUDIO_CHANNELS * sizeof(int16_t))
 #define PCM_BUF_COUNT    3
-#define PCM_READY_MAX    (PCM_BUF_COUNT - 1)
+#define PCM_IDX_NONE     0xFF
+
+enum pcm_owner_state {
+    PCM_FREE = 0,
+    PCM_WRITING,
+    PCM_READY,
+    PCM_READING,
+};
 
 static int16_t pcm_buf[PCM_BUF_COUNT][PCM_BUF_SAMPLES * USB_AUDIO_CHANNELS];
 static volatile uint32_t pcm_write_pos = 0;
 static volatile uint8_t  pcm_write_idx = 0;
-static volatile uint8_t  pcm_read_idx = 0;
-static volatile uint8_t  pcm_ready_count = 0;
+static volatile uint8_t  pcm_ready_idx = PCM_IDX_NONE;
+static volatile uint8_t  pcm_consumer_idx = PCM_IDX_NONE;
+static volatile uint8_t  pcm_state[PCM_BUF_COUNT] = {
+    PCM_WRITING, PCM_FREE, PCM_FREE
+};
+
+static void pcm_reset_stream_state(void)
+{
+    pcm_write_pos = 0;
+    pcm_ready_idx = PCM_IDX_NONE;
+
+    /* Never recycle a buffer currently owned by audio_task. A USB reset/open
+     * may preempt that task; it will release the buffer when it resumes. */
+    for (uint8_t i = 0; i < PCM_BUF_COUNT; i++) {
+        if (pcm_state[i] != PCM_READING)
+            pcm_state[i] = PCM_FREE;
+    }
+
+    uint8_t next = PCM_IDX_NONE;
+    for (uint8_t i = 0; i < PCM_BUF_COUNT; i++) {
+        if (pcm_state[i] == PCM_FREE) {
+            next = i;
+            break;
+        }
+    }
+    if (next == PCM_IDX_NONE) {
+        /* Impossible with one consumer and three buffers; recover safely. */
+        next = 0;
+        pcm_consumer_idx = PCM_IDX_NONE;
+    }
+    pcm_write_idx = next;
+    pcm_state[next] = PCM_WRITING;
+}
 
 static SemaphoreHandle_t audio_sem;
 static StaticSemaphore_t audio_sem_buf;
@@ -271,17 +312,36 @@ static void audio_ep_out_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
         if (pos >= PCM_BUF_SAMPLES * USB_AUDIO_CHANNELS) {
             pcm_write_pos = 0;
 
-            BaseType_t woken = pdFALSE;
-            if (pcm_ready_count < PCM_READY_MAX) {
-                pcm_ready_count++;
-                pcm_write_idx = (uint8_t)((pcm_write_idx + 1) % PCM_BUF_COUNT);
-                xSemaphoreGiveFromISR(audio_sem, &woken);
-            } else {
-                /* Backlog full: discard oldest complete frame and keep
-                 * the newest two instead of growing output latency. */
-                pcm_read_idx = (uint8_t)((pcm_read_idx + 1) % PCM_BUF_COUNT);
-                pcm_write_idx = (uint8_t)((pcm_write_idx + 1) % PCM_BUF_COUNT);
+            const uint8_t completed = pcm_write_idx;
+
+            /* Latest-only pending policy. A READING frame is never touched. */
+            if (pcm_ready_idx != PCM_IDX_NONE) {
+                pcm_state[pcm_ready_idx] = PCM_FREE;
             }
+            pcm_state[completed] = PCM_READY;
+            pcm_ready_idx = completed;
+
+            /* With 3 buffers and at most one READING + one READY, one FREE
+             * buffer always exists for the next USB producer frame. */
+            uint8_t next = PCM_IDX_NONE;
+            for (uint8_t i = 0; i < PCM_BUF_COUNT; i++) {
+                if (pcm_state[i] == PCM_FREE) {
+                    next = i;
+                    break;
+                }
+            }
+            if (next == PCM_IDX_NONE) {
+                /* Defensive recovery: drop the just-completed READY frame. */
+                pcm_state[completed] = PCM_WRITING;
+                pcm_ready_idx = PCM_IDX_NONE;
+                next = completed;
+            } else {
+                pcm_state[next] = PCM_WRITING;
+            }
+            pcm_write_idx = next;
+
+            BaseType_t woken = pdFALSE;
+            (void)xSemaphoreGiveFromISR(audio_sem, &woken);
             portYIELD_FROM_ISR(woken);
         } else {
             pcm_write_pos = pos;
@@ -338,10 +398,7 @@ void usbd_audio_open(uint8_t busid, uint8_t intf)
     if (intf == USB_AUDIO_INTF_STREAM) {
         LOG_INF("[AUDIO] Speaker stream opened\n");
         stream_active = true;
-        pcm_write_pos = 0;
-        pcm_write_idx = 0;
-        pcm_read_idx = 0;
-        pcm_ready_count = 0;
+        pcm_reset_stream_state();
         state_mgr_set_spk_active(true);
         int r = usbd_ep_start_read(busid, USB_AUDIO_EP_OUT, iso_rx_buf, sizeof(iso_rx_buf));
         if (r < 0)
@@ -410,7 +467,8 @@ uint32_t usbd_audio_get_sampling_freq(uint8_t busid, uint8_t ep)
 void usb_audio_early_init(void)
 {
     if (!audio_sem)
-        audio_sem = xSemaphoreCreateCountingStatic(PCM_READY_MAX, 0, &audio_sem_buf);
+        audio_sem = xSemaphoreCreateBinaryStatic(&audio_sem_buf);
+    pcm_reset_stream_state();
 }
 
 void usb_audio_register(uint8_t busid)
@@ -459,30 +517,41 @@ void usb_audio_stop(void)
     if (stream_active)
         LOG_INF("[AUDIO] usb_audio_stop\n");
     stream_active = false;
-    pcm_write_pos = 0;
-    pcm_write_idx = 0;
-    pcm_read_idx = 0;
-    pcm_ready_count = 0;
+    pcm_reset_stream_state();
     state_mgr_set_spk_active(false);
 }
 
-bool usb_audio_read(int16_t *out)
+const int16_t *usb_audio_acquire_frame(void)
 {
-    bool ok = false;
+    const int16_t *frame = NULL;
 
-    /* Prevent the ISO ISR from recycling the selected 4KB frame while
-     * it is copied. The critical section is tiny versus the 1ms USB
-     * audio cadence and gives deterministic ring ownership. */
+    /* Only metadata is protected. The 4KB payload stays in-place and its
+     * PCM_READING ownership prevents the ISR from recycling it. */
     taskENTER_CRITICAL();
-    if (pcm_ready_count != 0) {
-        uint8_t idx = pcm_read_idx;
-        memcpy(out, pcm_buf[idx], PCM_BUF_BYTES);
-        pcm_read_idx = (uint8_t)((pcm_read_idx + 1) % PCM_BUF_COUNT);
-        pcm_ready_count--;
-        ok = true;
+    if (pcm_ready_idx != PCM_IDX_NONE && pcm_consumer_idx == PCM_IDX_NONE) {
+        uint8_t idx = pcm_ready_idx;
+        pcm_ready_idx = PCM_IDX_NONE;
+        pcm_state[idx] = PCM_READING;
+        pcm_consumer_idx = idx;
+        frame = pcm_buf[idx];
     }
     taskEXIT_CRITICAL();
-    return ok;
+    return frame;
+}
+
+void usb_audio_release_frame(const int16_t *frame)
+{
+    if (!frame)
+        return;
+
+    taskENTER_CRITICAL();
+    uint8_t idx = pcm_consumer_idx;
+    if (idx != PCM_IDX_NONE && frame == pcm_buf[idx] &&
+        pcm_state[idx] == PCM_READING) {
+        pcm_state[idx] = PCM_FREE;
+        pcm_consumer_idx = PCM_IDX_NONE;
+    }
+    taskEXIT_CRITICAL();
 }
 
 void *usb_audio_get_semaphore(void)

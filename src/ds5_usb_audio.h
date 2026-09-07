@@ -49,12 +49,14 @@ const uint8_t *usb_audio_get_desc(uint16_t *len);
 bool usb_audio_is_active(void);
 
 /**
- * Read accumulated PCM data when ready. Returns true if a full 512-sample
- * block is available. Output buffer must be at least
- * USB_AUDIO_ACCUM_SAMPLES * USB_AUDIO_CHANNELS * 2 bytes.
- * Called from audio_task context.
+ * Acquire the newest complete 512-sample PCM frame without copying it.
+ * The returned buffer is owned by the caller until usb_audio_release_frame().
+ * At most one completed frame waits behind the currently consumed frame;
+ * if the consumer falls behind, stale pending audio is dropped instead of
+ * accumulating latency.
  */
-bool usb_audio_read(int16_t *out);
+const int16_t *usb_audio_acquire_frame(void);
+void usb_audio_release_frame(const int16_t *frame);
 
 /**
  * Reset audio streaming state (stream_active, PCM buffers, spk_active).

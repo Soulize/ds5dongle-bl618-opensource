@@ -63,8 +63,6 @@ volatile unsigned int opus_prof_ts[16];
 
 static QueueHandle_t mic_queue;
 
-static __attribute__((aligned(32))) int16_t pcm_block[ACCUM_SAMPLES * USB_AUDIO_CHANNELS];
-
 static __attribute__((aligned(32))) int16_t spk_resamp[OPUS_FRAME_SAMPLES * 2];
 static __attribute__((aligned(32))) int16_t mic_dec_mono[OPUS_FRAME_SAMPLES];
 static __attribute__((aligned(32))) int16_t mic_dec_stereo[OPUS_FRAME_SAMPLES * 2];
@@ -663,7 +661,8 @@ void audio_task(void *arg)
         TickType_t wait = pdMS_TO_TICKS(25);
         if (xSemaphoreTake(sem, wait) == pdTRUE) {
             bool a_active = usb_audio_is_active();
-            bool a_read   = a_active ? usb_audio_read(pcm_block) : false;
+            const int16_t *slot_pcm = a_active ? usb_audio_acquire_frame() : NULL;
+            bool a_read   = slot_pcm != NULL;
             bool a_bt     = bt_hid_host_get_state() == BT_HID_STATE_CONNECTED;
 
             if (a_active && a_read && a_bt)
@@ -740,7 +739,6 @@ void audio_task(void *arg)
                 }
 
                 const int slot = audio_batch_count;
-                const int16_t *slot_pcm = pcm_block;
 
 #if LOG_LEVEL >= 3
                 uint64_t t_hap0 = bflb_mtimer_get_time_us();
@@ -869,6 +867,9 @@ void audio_task(void *arg)
             audio_frame_done:
                 ;
             }
+
+            if (slot_pcm)
+                usb_audio_release_frame(slot_pcm);
         }
 
         if (mic_status_pending &&
