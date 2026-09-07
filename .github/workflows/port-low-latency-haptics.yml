@@ -40,51 +40,60 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           def replace_once(text, old, new, label):
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"{label}: expected 1 match, found {count}")
+              n = text.count(old)
+              if n != 1:
+                  raise SystemExit(f"{label}: expected 1 match, found {n}")
               return text.replace(old, new, 1)
 
-          # ---- USB PCM producer: 512 samples per frame, 2-frame backlog ----
-          p = Path('src/ds5_usb_audio.h')
+          def replace_region(text, start, end, new, label):
+              i = text.find(start)
+              if i < 0:
+                  raise SystemExit(f"{label}: start anchor missing")
+              j = text.find(end, i)
+              if j < 0:
+                  raise SystemExit(f"{label}: end anchor missing")
+              j += len(end)
+              return text[:i] + new + text[j:]
+
+          # ---- USB producer: expose one 512-sample frame every 10.67 ms ----
+          p = Path("src/ds5_usb_audio.h")
           s = p.read_text()
-          s = replace_once(s,
-          '''/* 1024 samples per channel accumulated before processing.
-           * 1024/48000 = 21.33ms = exactly 2 Opus frames per BT report.
-           * Using 1024 instead of 512 means ONE semaphore per BT send cycle,
-           * eliminating back-to-back semaphore bursts that cause stutter on Linux. */
-          #define USB_AUDIO_ACCUM_SAMPLES 1024''',
-          '''/* One 512-sample producer frame per channel.
-           * 512/48000 = 10.67ms. audio.c pipelines haptics/Opus per frame and
-           * batches two prepared frames into the unchanged DualSense 0x39 report.
-           * The USB side keeps a two-frame backlog so short scheduler stalls do not
-           * force us back to a 21.33ms producer granularity. */
-          #define USB_AUDIO_ACCUM_SAMPLES 512''',
-          'USB audio frame size')
+          pattern = re.compile(
+              r"/\* 1024 samples per channel accumulated before processing\..*?\*/\n"
+              r"#define USB_AUDIO_ACCUM_SAMPLES 1024",
+              re.S,
+          )
+          new = (
+              "/* One 512-sample producer frame per channel.\n"
+              " * 512/48000 = 10.67ms. audio.c prepares haptics/Opus per frame,\n"
+              " * then batches two prepared frames into the unchanged DualSense 0x39.\n"
+              " * A two-frame ready backlog absorbs short scheduler stalls. */\n"
+              "#define USB_AUDIO_ACCUM_SAMPLES 512"
+          )
+          s, n = pattern.subn(new, s, count=1)
+          if n != 1:
+              raise SystemExit(f"USB frame size comment: expected 1 match, found {n}")
           p.write_text(s)
 
-          p = Path('src/ds5_usb_audio.c')
+          p = Path("src/ds5_usb_audio.c")
           s = p.read_text()
-          s = replace_once(s,
-          '#include "semphr.h"\n#include <string.h>',
-          '#include "semphr.h"\n#include "task.h"\n#include <string.h>',
-          'task critical include')
+          s = replace_once(
+              s,
+              '#include "semphr.h"\n#include <string.h>',
+              '#include "semphr.h"\n#include "task.h"\n#include <string.h>',
+              "task critical include",
+          )
 
-          s = replace_once(s,
-          '''/* ---- Double buffer for ISO PCM accumulation ---- */
-          #define PCM_BUF_SAMPLES  USB_AUDIO_ACCUM_SAMPLES
-          #define PCM_BUF_BYTES    (PCM_BUF_SAMPLES * USB_AUDIO_CHANNELS * sizeof(int16_t))
-
-          static int16_t pcm_buf[2][PCM_BUF_SAMPLES * USB_AUDIO_CHANNELS];
-          static volatile uint32_t pcm_write_pos = 0;
-          static volatile uint8_t  pcm_write_idx = 0;
-          static volatile bool     pcm_ready = false;
-          static uint8_t           pcm_read_idx = 0;''',
-          '''/* ---- Low-latency PCM frame ring ----
+          s = replace_region(
+              s,
+              "/* ---- Double buffer for ISO PCM accumulation ---- */",
+              "static uint8_t           pcm_read_idx = 0;",
+              """/* ---- Low-latency PCM frame ring ----
            * One buffer is being filled while up to two complete 512-sample frames
-           * wait for audio_task. Memory use stays below the old 2x1024 ping-pong. */
+           * wait for audio_task. Memory use is lower than the old 2x1024 ping-pong. */
           #define PCM_BUF_SAMPLES  USB_AUDIO_ACCUM_SAMPLES
           #define PCM_BUF_BYTES    (PCM_BUF_SAMPLES * USB_AUDIO_CHANNELS * sizeof(int16_t))
           #define PCM_BUF_COUNT    3
@@ -94,303 +103,267 @@ jobs:
           static volatile uint32_t pcm_write_pos = 0;
           static volatile uint8_t  pcm_write_idx = 0;
           static volatile uint8_t  pcm_read_idx = 0;
-          static volatile uint8_t  pcm_ready_count = 0;''',
-          'PCM ring declaration')
+          static volatile uint8_t  pcm_ready_count = 0;""".replace("          ", ""),
+              "PCM ring declaration",
+          )
 
-          s = replace_once(s,
-          '''        if (pos >= PCM_BUF_SAMPLES * USB_AUDIO_CHANNELS) {
-              pcm_write_pos = 0;
-              pcm_write_idx ^= 1;
-              pcm_ready = true;
-              BaseType_t woken = pdFALSE;
-              xSemaphoreGiveFromISR(audio_sem, &woken);
-              portYIELD_FROM_ISR(woken);
-          } else {
-              pcm_write_pos = pos;
-          }''',
-          '''        if (pos >= PCM_BUF_SAMPLES * USB_AUDIO_CHANNELS) {
-              pcm_write_pos = 0;
+          old_roll_end = "        } else {\n            pcm_write_pos = pos;\n        }"
+          new_roll = (
+              "        if (pos >= PCM_BUF_SAMPLES * USB_AUDIO_CHANNELS) {\n"
+              "            pcm_write_pos = 0;\n"
+              "\n"
+              "            BaseType_t woken = pdFALSE;\n"
+              "            if (pcm_ready_count < PCM_READY_MAX) {\n"
+              "                pcm_ready_count++;\n"
+              "                pcm_write_idx = (uint8_t)((pcm_write_idx + 1) % PCM_BUF_COUNT);\n"
+              "                xSemaphoreGiveFromISR(audio_sem, &woken);\n"
+              "            } else {\n"
+              "                /* Backlog full: discard oldest complete frame and keep\n"
+              "                 * the newest two instead of growing output latency. */\n"
+              "                pcm_read_idx = (uint8_t)((pcm_read_idx + 1) % PCM_BUF_COUNT);\n"
+              "                pcm_write_idx = (uint8_t)((pcm_write_idx + 1) % PCM_BUF_COUNT);\n"
+              "            }\n"
+              "            portYIELD_FROM_ISR(woken);\n"
+              "        } else {\n"
+              "            pcm_write_pos = pos;\n"
+              "        }"
+          )
+          s = replace_region(
+              s,
+              "        if (pos >= PCM_BUF_SAMPLES * USB_AUDIO_CHANNELS) {",
+              old_roll_end,
+              new_roll,
+              "PCM producer rollover",
+          )
 
-              BaseType_t woken = pdFALSE;
-              if (pcm_ready_count < PCM_READY_MAX) {
-                  pcm_ready_count++;
-                  pcm_write_idx = (uint8_t)((pcm_write_idx + 1) % PCM_BUF_COUNT);
-                  xSemaphoreGiveFromISR(audio_sem, &woken);
-              } else {
-                  /* Consumer is behind: discard the oldest complete frame and
-                   * preserve the newest two. This is preferable to growing
-                   * haptics/audio latency with a FIFO backlog. */
-                  pcm_read_idx = (uint8_t)((pcm_read_idx + 1) % PCM_BUF_COUNT);
-                  pcm_write_idx = (uint8_t)((pcm_write_idx + 1) % PCM_BUF_COUNT);
-              }
-              portYIELD_FROM_ISR(woken);
-          } else {
-              pcm_write_pos = pos;
-          }''',
-          'PCM producer rollover')
+          s = replace_once(
+              s,
+              "        pcm_write_pos = 0;\n        pcm_write_idx = 0;\n        pcm_ready = false;",
+              "        pcm_write_pos = 0;\n        pcm_write_idx = 0;\n        pcm_read_idx = 0;\n        pcm_ready_count = 0;",
+              "stream open reset",
+          )
+          s = replace_once(
+              s,
+              "audio_sem = xSemaphoreCreateCountingStatic(2, 0, &audio_sem_buf);",
+              "audio_sem = xSemaphoreCreateCountingStatic(PCM_READY_MAX, 0, &audio_sem_buf);",
+              "counting semaphore depth",
+          )
+          s = replace_once(
+              s,
+              "    pcm_write_pos = 0;\n    pcm_write_idx = 0;\n    pcm_ready = false;\n    state_mgr_set_spk_active(false);",
+              "    pcm_write_pos = 0;\n    pcm_write_idx = 0;\n    pcm_read_idx = 0;\n    pcm_ready_count = 0;\n    state_mgr_set_spk_active(false);",
+              "stream stop reset",
+          )
 
-          s = replace_once(s,
-          '''        pcm_write_pos = 0;
-              pcm_write_idx = 0;
-              pcm_ready = false;''',
-          '''        pcm_write_pos = 0;
-              pcm_write_idx = 0;
-              pcm_read_idx = 0;
-              pcm_ready_count = 0;''',
-          'stream open reset')
-
-          s = replace_once(s,
-          'audio_sem = xSemaphoreCreateCountingStatic(2, 0, &audio_sem_buf);',
-          'audio_sem = xSemaphoreCreateCountingStatic(PCM_READY_MAX, 0, &audio_sem_buf);',
-          'counting semaphore depth')
-
-          s = replace_once(s,
-          '''    pcm_write_pos = 0;
-              pcm_write_idx = 0;
-              pcm_ready = false;
-              state_mgr_set_spk_active(false);''',
-          '''    pcm_write_pos = 0;
-              pcm_write_idx = 0;
-              pcm_read_idx = 0;
-              pcm_ready_count = 0;
-              state_mgr_set_spk_active(false);''',
-          'stream stop reset')
-
-          s = replace_once(s,
-          '''bool usb_audio_read(int16_t *out)
-          {
-              if (!pcm_ready)
-                  return false;
-
-              pcm_read_idx = pcm_write_idx ^ 1;
-              memcpy(out, pcm_buf[pcm_read_idx], PCM_BUF_BYTES);
-              pcm_ready = false;
-              return true;
-          }''',
-          '''bool usb_audio_read(int16_t *out)
-          {
-              bool ok = false;
-
-              /* Protect the ready-ring metadata and the short 4KB copy from the
-               * USB ISO ISR. At 320MHz this critical section is tiny compared with
-               * the 1ms USB audio interval and prevents a dropped-oldest rollover
-               * from overwriting the frame while it is being copied. */
-              taskENTER_CRITICAL();
-              if (pcm_ready_count != 0) {
-                  uint8_t idx = pcm_read_idx;
-                  memcpy(out, pcm_buf[idx], PCM_BUF_BYTES);
-                  pcm_read_idx = (uint8_t)((pcm_read_idx + 1) % PCM_BUF_COUNT);
-                  pcm_ready_count--;
-                  ok = true;
-              }
-              taskEXIT_CRITICAL();
-              return ok;
-          }''',
-          'PCM consumer')
+          read_start = "bool usb_audio_read(int16_t *out)\n{"
+          read_end = "\n\nvoid *usb_audio_get_semaphore(void)"
+          read_impl = (
+              "bool usb_audio_read(int16_t *out)\n"
+              "{\n"
+              "    bool ok = false;\n"
+              "\n"
+              "    /* Prevent the ISO ISR from recycling the selected 4KB frame while\n"
+              "     * it is copied. The critical section is tiny versus the 1ms USB\n"
+              "     * audio cadence and gives deterministic ring ownership. */\n"
+              "    taskENTER_CRITICAL();\n"
+              "    if (pcm_ready_count != 0) {\n"
+              "        uint8_t idx = pcm_read_idx;\n"
+              "        memcpy(out, pcm_buf[idx], PCM_BUF_BYTES);\n"
+              "        pcm_read_idx = (uint8_t)((pcm_read_idx + 1) % PCM_BUF_COUNT);\n"
+              "        pcm_ready_count--;\n"
+              "        ok = true;\n"
+              "    }\n"
+              "    taskEXIT_CRITICAL();\n"
+              "    return ok;\n"
+              "}"
+              "\n\nvoid *usb_audio_get_semaphore(void)"
+          )
+          s = replace_region(s, read_start, read_end, read_impl, "PCM consumer")
+          if "pcm_ready" in s:
+              raise SystemExit("legacy pcm_ready state still present")
           p.write_text(s)
 
-          # ---- audio.c: per-frame producers + two-frame 0x39 compositor ----
-          p = Path('src/audio.c')
+          # ---- Audio producer/compositor: prepare one frame at a time ----
+          p = Path("src/audio.c")
           s = p.read_text()
-          s = replace_once(s,
-          '''#define ACCUM_SAMPLES       USB_AUDIO_ACCUM_SAMPLES  /* 1024 = 2 Opus frames */
-          /* Half-block size: the 1024-sample block is split into two 512-sample halves,
-           * each resampled 512→480 and encoded as one Opus frame. */
-          #define HALF_ACCUM          (ACCUM_SAMPLES / 2)      /* 512 */''',
-          '''#define ACCUM_SAMPLES       USB_AUDIO_ACCUM_SAMPLES  /* 512 = one producer frame */
-          #define AUDIO_BATCH_FRAMES  2       /* DualSense 0x39 carries two frames */''',
-          'audio frame constants')
+          s = replace_region(
+              s,
+              "#define ACCUM_SAMPLES       USB_AUDIO_ACCUM_SAMPLES  /* 1024 = 2 Opus frames */",
+              "#define HALF_ACCUM          (ACCUM_SAMPLES / 2)      /* 512 */",
+              "#define ACCUM_SAMPLES       USB_AUDIO_ACCUM_SAMPLES  /* 512 = one producer frame */\n"
+              "#define AUDIO_BATCH_FRAMES  2       /* DualSense 0x39 carries two frames */",
+              "audio frame constants",
+          )
+          if s.count("HALF_ACCUM") < 3:
+              raise SystemExit("unexpected HALF_ACCUM use count")
+          s = s.replace("HALF_ACCUM", "ACCUM_SAMPLES")
 
-          half_count = s.count('HALF_ACCUM')
-          if half_count < 3:
-              raise SystemExit(f'HALF_ACCUM: expected >=3 uses, found {half_count}')
-          s = s.replace('HALF_ACCUM', 'ACCUM_SAMPLES')
+          s = replace_once(
+              s,
+              "static __attribute__((aligned(32))) uint8_t  opus_slots[2][OPUS_OUT_SIZE];\n"
+              "static __attribute__((aligned(32))) int8_t   haptic_slots[2][HAPTIC_BUF_SIZE];",
+              "static __attribute__((aligned(32))) uint8_t  opus_slots[AUDIO_BATCH_FRAMES][OPUS_OUT_SIZE];\n"
+              "static __attribute__((aligned(32))) int8_t   haptic_slots[AUDIO_BATCH_FRAMES][HAPTIC_BUF_SIZE];\n"
+              "static uint8_t  audio_batch_count;\n"
+              "static bool     audio_batch_speaker;\n"
+              "static bool     audio_batch_headset;\n"
+              "static int      audio_batch_channels;",
+              "audio batch state",
+          )
 
-          s = replace_once(s,
-          '''static __attribute__((aligned(32))) uint8_t  opus_slots[2][OPUS_OUT_SIZE];
-          static __attribute__((aligned(32))) int8_t   haptic_slots[2][HAPTIC_BUF_SIZE];
+          s = replace_once(
+              s,
+              "static int send_audio_report(void)",
+              "static int send_audio_report(bool speaker_enabled, bool headset_output)",
+              "compositor signature",
+          )
+          s = replace_once(
+              s,
+              "    /* Speaker Opus (tag 0xD3/0xD6, 2x 200-byte blocks) */\n"
+              "    bool speaker_enabled = !config_get()->disable_speaker;\n"
+              "    if (speaker_enabled) {\n"
+              "        pkt[140] = plug_headset ? DS5_AUDIO_TAG_HEADSET : DS5_AUDIO_TAG_SPEAKER;",
+              "    /* Speaker Opus is optional; haptics producer state is independent. */\n"
+              "    if (speaker_enabled) {\n"
+              "        pkt[140] = headset_output ? DS5_AUDIO_TAG_HEADSET : DS5_AUDIO_TAG_SPEAKER;",
+              "optional speaker payload",
+          )
 
-          static bool     silence_ready;''',
-          '''static __attribute__((aligned(32))) uint8_t  opus_slots[AUDIO_BATCH_FRAMES][OPUS_OUT_SIZE];
-          static __attribute__((aligned(32))) int8_t   haptic_slots[AUDIO_BATCH_FRAMES][HAPTIC_BUF_SIZE];
-          static uint8_t  audio_batch_count;
-          static bool     audio_batch_speaker;
-          static bool     audio_batch_headset;
-          static int      audio_batch_channels;
+          s = replace_once(
+              s,
+              "    memset(opus_slots, 0, sizeof(opus_slots));\n"
+              "    memset(haptic_slots, 0, sizeof(haptic_slots));\n\n"
+              "    encode_watchdog =",
+              "    memset(opus_slots, 0, sizeof(opus_slots));\n"
+              "    memset(haptic_slots, 0, sizeof(haptic_slots));\n"
+              "    audio_batch_count = 0;\n"
+              "    audio_batch_speaker = false;\n"
+              "    audio_batch_headset = false;\n"
+              "    audio_batch_channels = 1;\n\n"
+              "    encode_watchdog =",
+              "audio init batch reset",
+          )
 
-          static bool     silence_ready;''',
-          'audio batch state')
+          producer_start = "                for (int slot = 0; slot < 2; slot++) {"
+          producer_end = "#if LOG_LEVEL >= 3\n                uint64_t t_send0 = bflb_mtimer_get_time_us();\n#endif\n"
+          producer = """                /* DS5_Bridge-style producer separation: process one 512-sample
+                   USB frame as soon as it is complete. The Bluetooth 0x39 format
+                   remains a two-frame compositor. */
+                if (audio_batch_count != 0 &&
+                    (audio_batch_speaker != speaker_on ||
+                     audio_batch_headset != plug_headset ||
+                     audio_batch_channels != target_channels)) {
+                    audio_batch_count = 0;
+                }
+                if (audio_batch_count == 0) {
+                    audio_batch_speaker = speaker_on;
+                    audio_batch_headset = plug_headset;
+                    audio_batch_channels = target_channels;
+                }
 
-          s = replace_once(s,
-          'static int send_audio_report(void)',
-          'static int send_audio_report(bool speaker_enabled, bool headset_output)',
-          'audio compositor signature')
-          s = replace_once(s,
-          '''    /* Speaker Opus (tag 0xD3/0xD6, 2x 200-byte blocks) */
-              bool speaker_enabled = !config_get()->disable_speaker;
-              if (speaker_enabled) {
-                  pkt[140] = plug_headset ? DS5_AUDIO_TAG_HEADSET : DS5_AUDIO_TAG_SPEAKER;''',
-          '''    /* Speaker Opus is optional. Haptics producer state is independent. */
-              if (speaker_enabled) {
-                  pkt[140] = headset_output ? DS5_AUDIO_TAG_HEADSET : DS5_AUDIO_TAG_SPEAKER;''',
-          'optional speaker payload')
+                const int slot = audio_batch_count;
+                const int16_t *slot_pcm = pcm_block;
 
-          s = replace_once(s,
-          '''    memset(opus_slots, 0, sizeof(opus_slots));
-              memset(haptic_slots, 0, sizeof(haptic_slots));
+#if LOG_LEVEL >= 3
+                uint64_t t_hap0 = bflb_mtimer_get_time_us();
+#endif
+                if (ah_mode == 2) {
+                    audio_to_haptic(slot_pcm, haptic_slots[slot], ACCUM_SAMPLES);
+                } else if (ah_mode == 1 &&
+                           haptic_channel_silent(slot_pcm, ACCUM_SAMPLES)) {
+                    audio_to_haptic(slot_pcm, haptic_slots[slot], ACCUM_SAMPLES);
+                } else {
+                    decimate_haptics(slot_pcm, haptic_slots[slot], ACCUM_SAMPLES);
+                }
+#if LOG_LEVEL >= 3
+                prof_haptic += bflb_mtimer_get_time_us() - t_hap0;
+#endif
 
-              encode_watchdog =''',
-          '''    memset(opus_slots, 0, sizeof(opus_slots));
-              memset(haptic_slots, 0, sizeof(haptic_slots));
-              audio_batch_count = 0;
-              audio_batch_speaker = false;
-              audio_batch_headset = false;
-              audio_batch_channels = 1;
+                /* Optional speaker producer. Frame 0 is encoded roughly one USB
+                 * producer period earlier than with the old 1024-sample batch. */
+                if (speaker_on) {
+#if LOG_LEVEL >= 3
+                    uint64_t t_res0 = bflb_mtimer_get_time_us();
+#endif
+                    deinterleave_4ch(slot_pcm, ACCUM_SAMPLES);
+                    int mono = (encoder_channels == 1);
+                    resample_512_480(slot_pcm, spk_resamp, mono);
+#if LOG_LEVEL >= 3
+                    prof_resamp += bflb_mtimer_get_time_us() - t_res0;
+#endif
 
-              encode_watchdog =''',
-          'audio init batch reset')
+                    encode_start_us = bflb_mtimer_get_time_us();
+                    encoding_in_progress = true;
+                    int encoded = opus_encode(encoder, spk_resamp, OPUS_FRAME_SAMPLES,
+                                              opus_slots[slot], OPUS_OUT_SIZE);
+                    encoding_in_progress = false;
+#if LOG_LEVEL >= 3
+                    prof_opus += bflb_mtimer_get_time_us() - encode_start_us;
+#endif
+                    if (encoder_reset_pending) {
+                        encoder_reset_pending = false;
+                        opus_encoder_ctl(encoder, OPUS_RESET_STATE);
+                    }
+                    if (encoded <= 0) {
+                        LOG_ERR("[AUDIO] Opus encode error: %d\\n", encoded);
+                        memset(opus_slots[slot], 0, OPUS_OUT_SIZE);
+                    } else if (encoded < OPUS_OUT_SIZE) {
+                        int pad_ret = opus_packet_pad(opus_slots[slot], encoded, OPUS_OUT_SIZE);
+                        if (pad_ret != OPUS_OK)
+                            memset(opus_slots[slot] + encoded, 0, OPUS_OUT_SIZE - encoded);
+                    }
+                } else {
+                    memset(opus_slots[slot], 0, OPUS_OUT_SIZE);
+                }
 
-          start = s.find('                for (int slot = 0; slot < 2; slot++) {')
-          end_marker = '#if LOG_LEVEL >= 3\n                uint64_t t_send0 = bflb_mtimer_get_time_us();\n#endif\n'
-          end = s.find(end_marker, start)
-          if start < 0 or end < 0:
-              raise SystemExit('audio producer loop anchors not found')
+                audio_batch_count++;
+                if (audio_batch_count < AUDIO_BATCH_FRAMES)
+                    goto audio_frame_done;
 
-          producer = '''                /* DS5_Bridge-style producer separation: process one 512-sample
-                   USB frame as soon as it is complete. The 0x39 transport still
-                   batches two prepared frames, so the Bluetooth protocol is unchanged. */
-              if (audio_batch_count != 0 &&
-                  (audio_batch_speaker != speaker_on ||
-                   audio_batch_headset != plug_headset ||
-                   audio_batch_channels != target_channels)) {
-                  /* Route/codec shape changed mid-batch. Prefer a fresh pair over
-                   * mixing incompatible Opus frames in one controller packet. */
-                  audio_batch_count = 0;
-              }
-              if (audio_batch_count == 0) {
-                  audio_batch_speaker = speaker_on;
-                  audio_batch_headset = plug_headset;
-                  audio_batch_channels = target_channels;
-              }
+                /* Both haptic slots are ready. Do not insert the old fixed 1ms
+                 * mic delay; mic decode already runs in its own FreeRTOS task. */
+                audio_batch_count = 0;
 
-              const int slot = audio_batch_count;
-              const int16_t *slot_pcm = pcm_block;
+"""
+          s = replace_region(s, producer_start, producer_end, producer + producer_end, "producer pipeline")
+          s = replace_once(
+              s,
+              "                int send_ret = send_audio_report();",
+              "                int send_ret = send_audio_report(audio_batch_speaker, audio_batch_headset);",
+              "compositor call",
+          )
 
-          #if LOG_LEVEL >= 3
-              uint64_t t_hap0 = bflb_mtimer_get_time_us();
-          #endif
-              if (ah_mode == 2) {
-                  audio_to_haptic(slot_pcm, haptic_slots[slot], ACCUM_SAMPLES);
-              } else if (ah_mode == 1 &&
-                         haptic_channel_silent(slot_pcm, ACCUM_SAMPLES)) {
-                  audio_to_haptic(slot_pcm, haptic_slots[slot], ACCUM_SAMPLES);
-              } else {
-                  decimate_haptics(slot_pcm, haptic_slots[slot], ACCUM_SAMPLES);
-              }
-          #if LOG_LEVEL >= 3
-              prof_haptic += bflb_mtimer_get_time_us() - t_hap0;
-          #endif
-
-              /* Speaker producer is optional. When disabled, haptics never pay
-               * resampler/Opus cost; when enabled, frame N is encoded ~10.67ms
-               * earlier than in the old 1024-sample batch path. */
-              if (speaker_on) {
-          #if LOG_LEVEL >= 3
-                  uint64_t t_res0 = bflb_mtimer_get_time_us();
-          #endif
-                  deinterleave_4ch(slot_pcm, ACCUM_SAMPLES);
-                  int mono = (encoder_channels == 1);
-                  resample_512_480(slot_pcm, spk_resamp, mono);
-          #if LOG_LEVEL >= 3
-                  prof_resamp += bflb_mtimer_get_time_us() - t_res0;
-          #endif
-
-                  encode_start_us = bflb_mtimer_get_time_us();
-                  encoding_in_progress = true;
-                  int encoded = opus_encode(encoder, spk_resamp, OPUS_FRAME_SAMPLES,
-                                            opus_slots[slot], OPUS_OUT_SIZE);
-                  encoding_in_progress = false;
-          #if LOG_LEVEL >= 3
-                  prof_opus += bflb_mtimer_get_time_us() - encode_start_us;
-          #endif
-
-                  if (encoder_reset_pending) {
-                      encoder_reset_pending = false;
-                      opus_encoder_ctl(encoder, OPUS_RESET_STATE);
-                  }
-                  if (encoded <= 0) {
-                      LOG_ERR("[AUDIO] Opus encode error: %d\\n", encoded);
-                      memset(opus_slots[slot], 0, OPUS_OUT_SIZE);
-                  } else if (encoded < OPUS_OUT_SIZE) {
-                      int pad_ret = opus_packet_pad(opus_slots[slot], encoded, OPUS_OUT_SIZE);
-                      if (pad_ret != OPUS_OK)
-                          memset(opus_slots[slot] + encoded, 0, OPUS_OUT_SIZE - encoded);
-                  }
-              } else {
-                  memset(opus_slots[slot], 0, OPUS_OUT_SIZE);
-              }
-
-              audio_batch_count++;
-              if (audio_batch_count < AUDIO_BATCH_FRAMES)
-                  goto audio_frame_done;
-
-              /* Both haptic slots are ready. No fixed 1ms mic delay: mic decode
-               * already runs in its own task and should not stall controller output. */
-              audio_batch_count = 0;
-
-          '''
-          s = s[:start] + producer + s[end:]
-
-          s = replace_once(s,
-          '                int send_ret = send_audio_report();',
-          '                int send_ret = send_audio_report(audio_batch_speaker, audio_batch_headset);',
-          'audio compositor call')
-
-          task_tail = '''#endif
-              }
-          }
-
-          if (mic_status_pending &&'''
-          task_tail_new = '''#endif
-          audio_frame_done:
-              ;
-              }
-          }
-
-          if (mic_status_pending &&'''
-          pos = s.find('void audio_task(void *arg)')
-          tail_pos = s.find(task_tail, pos)
+          tail = "\n            }\n        }\n\n        if (mic_status_pending &&"
+          tail_new = "\n            audio_frame_done:\n                ;\n            }\n        }\n\n        if (mic_status_pending &&"
+          task_pos = s.find("void audio_task(void *arg)")
+          tail_pos = s.find(tail, task_pos)
           if tail_pos < 0:
-              raise SystemExit('audio task tail anchor not found')
-          s = s[:tail_pos] + task_tail_new + s[tail_pos + len(task_tail):]
+              raise SystemExit("audio task tail anchor missing")
+          s = s[:tail_pos] + tail_new + s[tail_pos + len(tail):]
 
-          # Reset any half-complete compositor batch on stream/codec reset or watchdog respawn.
-          s = replace_once(s,
-          '''    audio_task_killed = false;
+          respawn_pos = s.find("bool audio_check_respawn(void)")
+          marker = "    audio_task_killed = false;"
+          mark_pos = s.find(marker, respawn_pos)
+          if mark_pos < 0:
+              raise SystemExit("respawn reset anchor missing")
+          mark_end = mark_pos + len(marker)
+          s = s[:mark_end] + "\n    audio_batch_count = 0;" + s[mark_end:]
 
-              if (audio_task_handle) {''',
-          '''    audio_task_killed = false;
-              audio_batch_count = 0;
+          for fn in ("void audio_reset(void)", "void audio_reset_encoder(void)"):
+              fn_pos = s.find(fn)
+              if fn_pos < 0:
+                  raise SystemExit(f"{fn}: missing")
+              marker = "    memset(haptic_slots, 0, sizeof(haptic_slots));"
+              m = s.find(marker, fn_pos)
+              if m < 0:
+                  raise SystemExit(f"{fn}: slot reset missing")
+              m += len(marker)
+              s = s[:m] + "\n    audio_batch_count = 0;" + s[m:]
 
-              if (audio_task_handle) {''',
-          'watchdog batch reset')
-
-          reset_pattern = '''    memset(opus_slots, 0, sizeof(opus_slots));
-              memset(haptic_slots, 0, sizeof(haptic_slots));'''
-          # audio_init already handled; add reset to the remaining reset functions.
-          occurrences = s.count(reset_pattern)
-          if occurrences != 2:
-              raise SystemExit(f'reset slot pattern: expected 2 remaining matches, found {occurrences}')
-          s = s.replace(reset_pattern,
-          '''    memset(opus_slots, 0, sizeof(opus_slots));
-              memset(haptic_slots, 0, sizeof(haptic_slots));
-              audio_batch_count = 0;''')
-
-          if 'vTaskDelay(pdMS_TO_TICKS(1))' in s:
-              raise SystemExit('fixed 1ms mic delay still present')
+          if "vTaskDelay(pdMS_TO_TICKS(1))" in s:
+              raise SystemExit("fixed 1ms mic delay still present")
           p.write_text(s)
-
-          print('Direct source port applied successfully')
+          print("Direct source port applied successfully")
           PY
 
       - name: Install host dependencies
